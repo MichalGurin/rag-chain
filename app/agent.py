@@ -147,7 +147,13 @@ class ProductionAgent:
                         "query_count": self.query_expansion_count,
                     }
                 )
-                queries.extend(self._parse_rewritten_queries(message, rewrites))
+                queries.extend(
+                    self._parse_rewritten_queries(
+                        message,
+                        rewrites,
+                        max_queries=self.query_expansion_count,
+                    )
+                )
             except Exception as rewrite_error:
                 self.logger.warning(
                     "Query expansion failed; using the original question",
@@ -189,13 +195,13 @@ class ProductionAgent:
             )
             model_used = "fallback"
 
-        if not self._has_valid_citations(response, len(sources)):
+        if not self._has_valid_citation_format(response, len(sources)):
             self.logger.warning(
-                "Model response did not contain valid source citations"
+                "Model response did not contain valid citation formatting"
             )
             response = (
-                "I couldn't produce an answer grounded in the available "
-                "documents. Please try rephrasing your question."
+                "I couldn't produce an answer with valid source citations. "
+                "Please try rephrasing your question."
             )
 
         return {
@@ -235,7 +241,14 @@ class ProductionAgent:
         return [document for _, _, document in ordered[: self.retrieval_k]]
 
     @staticmethod
-    def _parse_rewritten_queries(original: str, rewritten: str) -> list[str]:
+    def _parse_rewritten_queries(
+        original: str,
+        rewritten: str,
+        max_queries: int = 3,
+    ) -> list[str]:
+        if max_queries <= 0:
+            return []
+
         queries: list[str] = []
         seen = {original.strip().casefold()}
         for line in rewritten.splitlines():
@@ -244,10 +257,12 @@ class ProductionAgent:
             if query and normalized not in seen:
                 queries.append(query)
                 seen.add(normalized)
+                if len(queries) >= max_queries:
+                    break
         return queries
 
     @staticmethod
-    def _has_valid_citations(response: str, source_count: int) -> bool:
+    def _has_valid_citation_format(response: str, source_count: int) -> bool:
         citations = re.findall(r"\[(\d+)\]", response)
         return bool(citations) and all(
             1 <= int(citation) <= source_count for citation in citations

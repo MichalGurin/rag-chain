@@ -240,6 +240,7 @@ def chat(
 
 
 @app.post("/documents", response_model=IngestResponse)
+@limiter.limit(get_settings().ingest_rate_limit)
 def ingest_documents(
     request: Request,
     body: IngestRequest,
@@ -260,6 +261,15 @@ def ingest_documents(
         x_ingest_api_key,
     ):
         raise HTTPException(status_code=401, detail="Invalid ingestion API key.")
+    total_content_chars = sum(len(document.content) for document in body.documents)
+    if total_content_chars > settings.max_ingest_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "The total document content exceeds the "
+                f"{settings.max_ingest_chars}-character ingestion limit."
+            ),
+        )
 
     try:
         chunks_indexed = request.app.state.agent.ingest_documents(body.documents)

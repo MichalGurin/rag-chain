@@ -13,6 +13,12 @@ services:
         value: INFO
       - key: RATE_LIMIT
         value: "20/minute"
+      - key: INGEST_RATE_LIMIT
+        value: "5/minute"
+      - key: MAX_INGEST_CHARS
+        value: "250000"
+      - key: FORWARDED_ALLOW_IPS
+        sync: false
       - key: CACHE_TTL_SECONDS
         value: "300"
       - key: CACHE_MAX_ENTRIES

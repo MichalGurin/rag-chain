@@ -112,6 +112,55 @@ def test_ingestion_is_disabled_without_an_ingest_key(monkeypatch):
     assert response.json()["detail"] == "Document ingestion is disabled."
 
 
+def test_ingestion_rejects_batches_over_character_limit(monkeypatch):
+    settings = Settings(
+        _env_file=None,
+        ingest_api_key=SecretStr("ingest-secret"),
+        max_ingest_chars=10,
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/documents",
+            json={
+                "documents": [
+                    {"source": "guide", "content": "More than ten characters"}
+                ]
+            },
+            headers={"X-Ingest-API-Key": "ingest-secret"},
+        )
+
+    assert response.status_code == 413
+    assert "10-character ingestion limit" in response.json()["detail"]
+
+
+def test_ingestion_endpoint_applies_its_rate_limit(monkeypatch):
+    settings = Settings(
+        _env_file=None,
+        ingest_api_key=SecretStr("ingest-secret"),
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+    payload = {
+        "documents": [{"source": "guide", "content": "Document content."}]
+    }
+
+    with TestClient(main.app, client=("198.51.100.27", 12345)) as client:
+        responses = [
+            client.post(
+                "/documents",
+                json=payload,
+                headers={"X-Ingest-API-Key": "ingest-secret"},
+            )
+            for _ in range(6)
+        ]
+
+    assert [response.status_code for response in responses[:5]] == [200] * 5
+    assert responses[5].status_code == 429
+
+
 def test_readiness_checks_database(api_client):
     response = api_client.get("/health")
 

@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     rate_limit: str = "20/minute"
+    ingest_rate_limit: str = "5/minute"
+    max_ingest_chars: int = Field(default=250_000, ge=1, le=5_000_000)
     cache_ttl_seconds: int = Field(default=300, ge=0)
     cache_max_entries: int = Field(default=1000, ge=1)
     chat_api_key: SecretStr | None = None

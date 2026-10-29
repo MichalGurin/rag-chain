@@ -76,6 +76,14 @@ def test_query_expansion_adds_distinct_search_terms():
     ) == ["How to terminate a subscription?", "Cancellation policy"]
 
 
+def test_query_expansion_caps_parsed_rewrites():
+    assert ProductionAgent._parse_rewritten_queries(
+        "How do I cancel?",
+        "First alternative\nSecond alternative\nThird alternative",
+        max_queries=2,
+    ) == ["First alternative", "Second alternative"]
+
+
 def test_retrieval_uses_mmr_and_fuses_duplicate_results():
     agent = make_agent()
     first = Document(page_content="First", metadata={"source": "guide"})
@@ -154,9 +162,16 @@ def test_invalid_citations_are_replaced_with_abstention():
     result = agent.invoke("What is the fact?")
 
     assert result["response"].startswith(
-        "I couldn't produce an answer grounded"
+        "I couldn't produce an answer with valid source citations"
     )
     assert result["sources"] == ["source-a"]
+
+
+def test_citation_format_does_not_claim_to_verify_grounding():
+    assert ProductionAgent._has_valid_citation_format(
+        "An unsupported statement [1].",
+        source_count=1,
+    )
 
 
 def test_retrieval_context_respects_character_budget_and_source_citations():

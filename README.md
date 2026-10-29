@@ -86,9 +86,17 @@ The chat chain can expand a question into alternative search queries, applies
 pgvector maximal-marginal-relevance retrieval, and fuses repeated results
 across queries. These defaults help with vocabulary mismatch and redundant
 chunks; disable `QUERY_EXPANSION_ENABLED` to avoid its additional model call.
-`MAX_CONTEXT_CHARS` bounds the prompt context, and answers without valid source
-citations are replaced with a safe abstention. These are quality safeguards,
-not guarantees of factual correctness; evaluate them against your corpus.
+The number of rewritten queries is capped in code at `QUERY_EXPANSION_COUNT`.
+`MAX_CONTEXT_CHARS` bounds the prompt context. Citation checks validate only
+that answers contain citation markers within the retrieved-source range; they
+do not establish that a source supports a claim. This is a formatting safeguard,
+not a grounding evaluation or guarantee of factual correctness; evaluate answers
+against your corpus.
+
+Ingestion is limited to 100 documents and `MAX_INGEST_CHARS` total content
+characters per request (250,000 by default). `/documents` also has its own
+`INGEST_RATE_LIMIT` (5 requests per minute by default), in addition to requiring
+the ingestion key.
 
 ## Chat API
 
@@ -127,7 +135,10 @@ Docker image in `app/Dockerfile`. For a cloud deployment:
    provider's pgvector-compatible PostgreSQL URL, for example
    `postgresql+psycopg://...`.
 4. Configure database access so only the application can connect. Run the
-   service behind a trusted proxy/load balancer and use HTTPS.
+   service behind a trusted proxy/load balancer and use HTTPS. Set
+   `FORWARDED_ALLOW_IPS` to the proxy's trusted IP address(es) or CIDR ranges;
+   the container defaults to trusting only `127.0.0.1`. Do not use `*` unless
+   network controls ensure that only your trusted proxy can reach the app.
 5. Review the provider plan, database sizing, backup/recovery, log retention,
    rate limits, and cost controls for the expected workload.
 
@@ -141,7 +152,8 @@ metrics, not a replacement for a production metrics backend.
   isolation, user identity, or per-user authorization. Add those before
   indexing private or customer-specific content.
 - Protect `/documents` with a separate ingestion key and expose it only to
-  trusted operators. Do not send untrusted or oversized source data.
+  trusted operators. The API limits ingestion request size and rate, but these
+  controls do not replace operator authorization or workload monitoring.
 - Prompt-injection pattern checks are heuristics, not a security boundary.
   Treat retrieved content as untrusted, validate sources and outputs, and add
   application-specific abuse controls and evaluations.
@@ -151,7 +163,9 @@ metrics, not a replacement for a production metrics backend.
   late chunking; add those only when the corpus and evaluation show they help.
 - The default cache and rate limiter are in-memory. Use a shared backend and
   identity-aware cache keys when scaling horizontally or serving personalized
-  answers.
+  answers. Rate limits use the client address; configure `FORWARDED_ALLOW_IPS`
+  with only the deployment's trusted proxy ranges so requests are not all
+  attributed to the proxy or spoofed by untrusted forwarded headers.
 - LangSmith tracing is not configured by the application. If you enable it
   through LangChain's standard environment variables, review its data
   retention and privacy settings before sending prompts or retrieved content.
