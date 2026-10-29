@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: prod-rag-api
+    runtime: docker
+    region: oregon
+    plan: starter
+    dockerfilePath: ./app/Dockerfile
+    dockerContext: .
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: RATE_LIMIT
+        value: "20/minute"
+      - key: CACHE_TTL_SECONDS
+        value: "300"
+      - key: CACHE_MAX_ENTRIES
+        value: "1000"
+      - key: PRIMARY_MODEL
+        value: llama3.2:1b
+      - key: FALLBACK_MODEL
+        value: llama3.2:1b
+      - key: EMBEDDING_MODEL
+        value: nomic-embed-text
+      - key: LLM_BASE_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CHAT_API_KEY
+        sync: false
+      - key: INGEST_API_KEY
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true

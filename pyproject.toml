@@ -1,0 +1,37 @@
+[project]
+name = "prod-rag"
+version = "0.1.0"
+description = "A production-oriented FastAPI RAG starter using pgvector"
+readme = "README.md"
+requires-python = ">=3.15.2"
+dependencies = [
+    "fastapi>=0.115.0",
+    "langchain-openai>=0.3.0",
+    "langchain-postgres>=0.0.15",
+    "langchain-text-splitters>=0.3.8",
+    "psycopg[binary]>=3.2.3",
+    "pydantic-settings>=2.7.0",
+    "slowapi @ https://github.com/simonvanlierde/slowapi/archive/3193123f4ffd3faa29786777d102d6d4357b89a3.tar.gz",
+    "uvicorn>=0.34.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.12,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+markers = [
+    "integration: API-level integration tests with external providers stubbed",
+]
+
+[tool.uv.build-backend]
+module-name = "app"
+module-root = "."
