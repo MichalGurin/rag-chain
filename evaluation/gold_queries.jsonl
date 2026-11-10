@@ -1,0 +1,3 @@
+{"query":"How many days of annual leave do employees receive?","expected_sources":["handbook/leave-policy"]}
+{"query":"What is the process for reporting a security incident?","expected_sources":["security/incident-response"]}
+{"query":"How long must financial records be retained?","expected_sources":["policies/records-retention"]}

@@ -24,6 +24,13 @@ def test_agent_configures_chat_and_embeddings_for_local_compatible_endpoint(
     monkeypatch.setattr(agent_module, "ChatOpenAI", fake_chat_openai)
     monkeypatch.setattr(agent_module, "OpenAIEmbeddings", fake_embeddings)
     monkeypatch.setattr(agent_module, "PGVector", Mock())
+    database_engine = Mock()
+    create_database_engine = Mock(return_value=database_engine)
+    monkeypatch.setattr(
+        agent_module,
+        "create_database_engine",
+        create_database_engine,
+    )
     settings = Settings(
         _env_file=None,
         database_url=SecretStr("postgresql+psycopg://user:pass@db/rag"),
@@ -35,6 +42,7 @@ def test_agent_configures_chat_and_embeddings_for_local_compatible_endpoint(
 
     agent_module.ProductionAgent(settings)
 
+    create_database_engine.assert_called_once_with(settings)
     assert [call["model"] for call in chat_calls] == [
         "llama3.2:1b",
         "qwen2.5:1.5b",

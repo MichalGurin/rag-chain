@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field, field_validator
@@ -41,6 +42,12 @@ class DocumentInput(BaseModel):
         return value
 
 
+@dataclass(frozen=True)
+class ParsedDocument:
+    source: str
+    content: str
+
+
 class IngestRequest(BaseModel):
     documents: list[DocumentInput] = Field(min_length=1, max_length=100)
 
@@ -48,6 +55,24 @@ class IngestRequest(BaseModel):
 class IngestResponse(BaseModel):
     documents_received: int
     chunks_indexed: int
+
+
+class DocumentUploadResponse(BaseModel):
+    document_id: str
+    source: str
+    status: str
+    duplicate: bool = False
+
+
+class DocumentStatusResponse(BaseModel):
+    document_id: str
+    source: str
+    status: str
+    chunks_indexed: int
+    page_count: int
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class HealthResponse(BaseModel):

@@ -1,13 +1,25 @@
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 from fastapi.testclient import TestClient
 import pytest
 from pydantic import SecretStr
 from langchain_core.documents import Document
 
 from app import main
+from app.api import documents as document_api
 from app.agent import ProductionAgent
 from app.config import Settings
 
 pytestmark = pytest.mark.integration
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+}
 
 
 class FakeAgent:
@@ -37,6 +49,7 @@ def api_client(monkeypatch):
         _env_file=None,
         ingest_api_key=SecretStr("ingest-secret"),
     )
+    settings.database_url = None
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
     with TestClient(main.app) as client:
@@ -93,14 +106,16 @@ def test_ingestion_requires_key_and_indexes_documents(api_client):
     assert len(api_client.app.state.agent.queries) == 2
 
 
-def test_ingestion_is_disabled_without_an_ingest_key(monkeypatch):
+def test_local_default_ingest_key_enables_ingestion(monkeypatch):
     settings = Settings(_env_file=None)
+    settings.database_url = None
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
 
     with TestClient(main.app) as client:
         response = client.post(
             "/documents",
+            headers={"X-Ingest-API-Key": "local-ingest-key"},
             json={
                 "documents": [
                     {"source": "guide", "content": "Document content."}
@@ -108,8 +123,8 @@ def test_ingestion_is_disabled_without_an_ingest_key(monkeypatch):
             },
         )
 
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Document ingestion is disabled."
+    assert response.status_code == 200
+    assert response.json() == {"documents_received": 1, "chunks_indexed": 2}
 
 
 def test_ingestion_rejects_batches_over_character_limit(monkeypatch):
@@ -141,6 +156,7 @@ def test_ingestion_endpoint_applies_its_rate_limit(monkeypatch):
         _env_file=None,
         ingest_api_key=SecretStr("ingest-secret"),
     )
+    settings.database_url = None
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
     payload = {
@@ -159,6 +175,160 @@ def test_ingestion_endpoint_applies_its_rate_limit(monkeypatch):
 
     assert [response.status_code for response in responses[:5]] == [200] * 5
     assert responses[5].status_code == 429
+
+
+def test_upload_queues_file_and_exposes_protected_job_status(
+    tmp_path,
+    monkeypatch,
+):
+    settings = Settings(
+        _env_file=None,
+        ingest_api_key=SecretStr("ingest-secret"),
+        database_url=SecretStr("postgresql+psycopg://user:pass@localhost/rag"),
+        upload_dir=str(tmp_path),
+    )
+    repository = FakeDocumentRepository()
+    engine = SimpleNamespace(dispose=Mock())
+    queued_task = SimpleNamespace(
+        apply_async=Mock(side_effect=[RuntimeError("broker down"), None])
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+    monkeypatch.setattr(main, "create_database_engine", lambda _settings: engine)
+    monkeypatch.setattr(
+        main,
+        "DocumentRepository",
+        lambda _engine, **_kwargs: repository,
+    )
+    monkeypatch.setattr(document_api, "process_document", queued_task)
+    headers = {"X-Ingest-API-Key": "ingest-secret"}
+    upload = {
+        "file": (
+            "handbook.txt",
+            b"Employees receive 20 days of annual leave.",
+            "text/plain",
+        )
+    }
+
+    with TestClient(main.app) as client:
+        accepted = client.post(
+            "/documents/upload",
+            files=upload,
+            headers=headers,
+        )
+        repeated = client.post(
+            "/documents/upload",
+            files=upload,
+            headers=headers,
+        )
+        status = client.get(
+            f"/documents/{accepted.json()['document_id']}",
+            headers=headers,
+        )
+        unauthorized = client.get(
+            f"/documents/{accepted.json()['document_id']}"
+        )
+
+    assert accepted.status_code == 202
+    assert repeated.status_code == 202
+    assert accepted.json()["status"] == "queued"
+    assert accepted.json()["source"] == "handbook.txt"
+    assert repeated.json()["duplicate"] is True
+    assert repeated.json()["document_id"] == accepted.json()["document_id"]
+    assert status.status_code == 200
+    assert status.json()["status"] == "queued"
+    assert status.json()["page_count"] == 0
+    assert unauthorized.status_code == 401
+    assert queued_task.apply_async.call_count == 2
+    expected_dispatch = {
+        "args": [accepted.json()["document_id"]],
+        "task_id": accepted.json()["document_id"],
+        "retry": False,
+    }
+    assert queued_task.apply_async.call_args_list[0].kwargs == expected_dispatch
+    assert queued_task.apply_async.call_args_list[1].kwargs == expected_dispatch
+    assert engine.dispose.called
+
+
+def test_upload_and_job_status_reject_missing_or_invalid_ingest_keys(api_client):
+    upload = {
+        "file": ("handbook.txt", b"Employees receive 20 days.", "text/plain")
+    }
+
+    missing_key = api_client.post("/documents/upload", files=upload)
+    invalid_key = api_client.post(
+        "/documents/upload",
+        files=upload,
+        headers={"X-Ingest-API-Key": "wrong-key"},
+    )
+    hidden_job = api_client.get("/documents/private-job")
+
+    assert missing_key.status_code == 401
+    assert invalid_key.status_code == 401
+    assert hidden_job.status_code == 401
+    assert "private-job" not in hidden_job.text
+
+
+class FakeDocumentRepository:
+    def __init__(self):
+        self.rows = {}
+        self.published = set()
+
+    def register(
+        self,
+        *,
+        document_id,
+        source,
+        sha256,
+        indexing_version,
+        object_path,
+        content_type,
+    ):
+        existing = self.rows.get(source)
+        if (
+            existing is not None
+            and existing["sha256"] == sha256
+            and existing["indexing_version"] == indexing_version
+        ):
+            return existing, existing["status"] == "queued"
+        now = datetime.now(timezone.utc)
+        row = {
+            "id": document_id,
+            "source": source,
+            "sha256": sha256,
+            "indexing_version": indexing_version,
+            "object_path": object_path,
+            "content_type": content_type,
+            "status": "queued",
+            "chunks_indexed": 0,
+            "page_count": 0,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self.rows[source] = row
+        return row, True
+
+    def get(self, document_id):
+        return next(
+            (
+                row
+                for row in self.rows.values()
+                if row["id"] == document_id
+            ),
+            None,
+        )
+
+    def dispatch_pending(self, publish):
+        queued = [
+            row
+            for row in self.rows.values()
+            if row["status"] == "queued" and row["id"] not in self.published
+        ]
+        for row in queued:
+            publish(args=[row["id"]], task_id=row["id"], retry=False)
+            self.published.add(row["id"])
+        return len(queued)
 
 
 def test_readiness_checks_database(api_client):
@@ -188,11 +358,119 @@ def test_readiness_returns_service_unavailable_when_database_is_down(
     assert response.json()["checks"]["database"] is False
 
 
+def test_security_headers_cover_success_and_error_responses(api_client):
+    responses = [
+        api_client.get("/health/live"),
+        api_client.get("/health"),
+        api_client.get("/metrics"),
+        api_client.get("/cache/stats"),
+        api_client.get("/openapi.json"),
+        api_client.get("/documents/missing"),
+        api_client.post("/chat", json={"message": "Hello"}),
+    ]
+
+    for response in responses:
+        assert response.headers["X-Request-ID"]
+        for header, expected_value in SECURITY_HEADERS.items():
+            assert response.headers[header] == expected_value
+
+
+def test_service_endpoint_inventory_stays_explicit():
+    service_routes = {
+        (path, method.upper())
+        for path, methods in main.app.application.openapi()["paths"].items()
+        for method in methods
+    }
+
+    assert service_routes == {
+        ("/chat", "POST"),
+        ("/documents", "POST"),
+        ("/documents/upload", "POST"),
+        ("/documents/{document_id}", "GET"),
+        ("/health/live", "GET"),
+        ("/health", "GET"),
+        ("/metrics", "GET"),
+        ("/cache/stats", "GET"),
+    }
+
+
+def test_production_https_responses_include_hsts(monkeypatch):
+    settings = Settings(
+        _env_file=None,
+        app_env="production",
+        chat_api_key=SecretStr("chat-secret"),
+        tenant_id="test-tenant",
+        database_url=SecretStr("postgresql+psycopg://db/rag"),
+        redis_url=SecretStr("redis://redis:6379/0"),
+        llm_base_url="https://llm.example.com/v1",
+        s3_endpoint_url="https://s3.example.com",
+        s3_bucket="documents",
+        s3_access_key_id=SecretStr("test-access"),
+        s3_secret_access_key=SecretStr("test-secret"),
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+
+    with TestClient(main.app, base_url="https://testserver") as client:
+        secure_response = client.get("/health/live")
+    with TestClient(main.app, base_url="http://testserver") as client:
+        plain_response = client.get("/health/live")
+
+    assert secure_response.headers["Strict-Transport-Security"] == (
+        "max-age=31536000; includeSubDomains"
+    )
+    assert "Strict-Transport-Security" not in plain_response.headers
+
+
+def test_upload_registration_failure_is_sanitized_and_cleans_file(
+    tmp_path,
+    monkeypatch,
+):
+    settings = Settings(
+        _env_file=None,
+        ingest_api_key=SecretStr("ingest-secret"),
+        database_url=SecretStr("postgresql+psycopg://db/rag"),
+        upload_dir=str(tmp_path),
+    )
+    engine = SimpleNamespace(dispose=Mock())
+
+    class FailedRepository:
+        def __init__(self, _engine, **_kwargs):
+            pass
+
+        def register(self, **_kwargs):
+            raise RuntimeError("database password must not be exposed")
+
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+    monkeypatch.setattr(main, "create_database_engine", lambda _settings: engine)
+    monkeypatch.setattr(main, "DocumentRepository", FailedRepository)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/documents/upload",
+            headers={"X-Ingest-API-Key": "ingest-secret"},
+            files={"file": ("policy.txt", b"policy", "text/plain")},
+        )
+
+    assert response.status_code == 503
+    assert "database password" not in response.text
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_production_chat_requires_valid_api_key(monkeypatch):
     settings = Settings(
         _env_file=None,
         app_env="production",
         chat_api_key=SecretStr("chat-secret"),
+        tenant_id="test-tenant",
+        database_url=SecretStr("postgresql+psycopg://db/rag"),
+        redis_url=SecretStr("redis://redis:6379/0"),
+        llm_base_url="https://llm.example.com/v1",
+        s3_endpoint_url="https://s3.example.com",
+        s3_bucket="documents",
+        s3_access_key_id=SecretStr("test-access"),
+        s3_secret_access_key=SecretStr("test-secret"),
     )
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
@@ -227,9 +505,11 @@ def test_rag_failure_returns_safe_upstream_error(monkeypatch):
 
 def test_chat_integrates_retrieval_citations_and_response_validation(monkeypatch):
     settings = Settings(_env_file=None, query_expansion_enabled=False)
+    settings.database_url = None
     monkeypatch.setattr(main, "get_settings", lambda: settings)
 
     agent = ProductionAgent.__new__(ProductionAgent)
+    agent.tenant_id = "local"
     agent.vector_store = MockVectorStore(
         [
             Document(
@@ -274,7 +554,8 @@ class MockVectorStore:
     def __init__(self, documents):
         self.documents = documents
 
-    def max_marginal_relevance_search(self, _query, *, k, fetch_k):
+    def max_marginal_relevance_search(self, _query, *, k, fetch_k, filter):
         assert k == 2
         assert fetch_k == 4
+        assert filter == {"tenant_id": "local"}
         return self.documents

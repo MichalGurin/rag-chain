@@ -1,4 +1,5 @@
-from unittest.mock import Mock
+import hashlib
+from unittest.mock import MagicMock, Mock
 
 from langchain_core.documents import Document
 
@@ -10,6 +11,7 @@ from app.monitoring import get_logger
 def make_agent():
     agent = ProductionAgent.__new__(ProductionAgent)
     agent.vector_store = Mock()
+    agent.tenant_id = "local"
     agent.retrieval_k = 2
     agent.retrieval_candidates_k = 3
     agent.max_context_chars = 12000
@@ -43,6 +45,7 @@ def test_agent_retrieves_context_and_returns_source_labels():
         "How many leave days?",
         k=3,
         fetch_k=6,
+        filter={"tenant_id": "local"},
     )
     context = agent.primary_chain.invoke.call_args.args[0]["context"]
     assert "[1] Source: handbook/leave-policy" in context
@@ -101,6 +104,49 @@ def test_retrieval_uses_mmr_and_fuses_duplicate_results():
         "First",
     ]
     assert agent.vector_store.max_marginal_relevance_search.call_count == 2
+
+
+def test_bm25_keyword_ranking_accounts_for_term_frequency_and_length():
+    agent = make_agent()
+    repeated = Document(
+        page_content="blue blue blue silver",
+        metadata={"source": "repeated"},
+    )
+    concise = Document(
+        page_content="blue silver",
+        metadata={"source": "concise"},
+    )
+    agent._keyword_search = Mock(return_value=[concise, repeated])
+
+    results = agent._bm25_search("blue")
+
+    assert [document.metadata["source"] for document in results] == [
+        "repeated",
+        "concise",
+    ]
+
+
+def test_keyword_search_scopes_sql_query_to_configured_tenant():
+    agent = make_agent()
+    agent.tenant_id = "tenant-a"
+    agent.db_engine = MagicMock()
+    agent.vector_collection_name = "documents"
+    agent.retrieval_candidates_k = 3
+    agent._fts_index_ready = True
+    connection = agent.db_engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value.mappings.return_value = [
+        {
+            "document": "Tenant content.",
+            "cmetadata": {"source": "guide", "tenant_id": "tenant-a"},
+        }
+    ]
+
+    documents = agent._keyword_search("tenant content")
+
+    assert len(documents) == 1
+    statement, parameters = connection.execute.call_args.args
+    assert "cmetadata->>'tenant_id' = :tenant_id" in str(statement)
+    assert parameters["tenant_id"] == "tenant-a"
 
 
 def test_empty_retrieval_abstains_without_calling_the_llm():
@@ -211,6 +257,33 @@ def test_document_ingestion_assigns_stable_source_chunk_ids():
     assert first_count == second_count == 1
     assert first_ids == second_ids
     assert len(first_ids[0]) == 64
+    expected_id = hashlib.sha256(
+        b"local\0guide\0" b"0\0Sample content. chunk"
+    ).hexdigest()
+    assert first_ids == [expected_id]
+
+
+def test_document_ingestion_assigns_server_tenant_metadata():
+    agent = make_agent()
+    agent.tenant_id = "tenant-a"
+    agent.text_splitter = Mock()
+    agent.text_splitter.split_documents.side_effect = lambda docs: [
+        Document(
+            page_content=docs[0].page_content,
+            metadata=dict(docs[0].metadata),
+        )
+    ]
+
+    agent.ingest_documents(
+        [DocumentInput(source="guide", content="Tenant content.")]
+    )
+
+    indexed = agent.vector_store.add_documents.call_args.kwargs["documents"][0]
+    assert indexed.metadata == {
+        "source": "guide",
+        "tenant_id": "tenant-a",
+        "chunk_index": 0,
+    }
 
 
 def test_database_url_schemes_are_normalized():

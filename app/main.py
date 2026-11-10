@@ -2,15 +2,24 @@ import hmac
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+)
 from fastapi.responses import JSONResponse
-from slowapi import Limiter
+from starlette.datastructures import State
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 from app.agent import ProductionAgent
+from app.api.documents import router as documents_router
+from app.api.limits import limiter
 from app.cache import CachedResponse, ResponseCache
 from app.config import get_settings
+from app.db import DocumentRepository, create_database_engine
 from app.models import (
     ChatRequest,
     ChatResponse,
@@ -25,11 +34,31 @@ from app.security import SecurityPipeline
 
 
 logger = get_logger()
-limiter = Limiter(key_func=get_remote_address)
+
+
+def _security_header_values(
+    *,
+    production: bool,
+    https: bool,
+) -> dict[str, str]:
+    """Return security headers shared by normal and early-rejected responses."""
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        "Cross-Origin-Opener-Policy": "same-origin",
+    }
+    if production and https:
+        headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+    return headers
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    """Create shared resources at startup and release them during shutdown."""
     settings = get_settings()
     application.state.settings = settings
     application.state.security = SecurityPipeline()
@@ -39,26 +68,60 @@ async def lifespan(application: FastAPI):
     )
     application.state.metrics = MetricsCollector()
 
-    logger.setLevel(settings.log_level.upper())
-    logger.info(
-        "Starting RAG API",
-        extra={
-            "extra_data": {
-                "environment": settings.app_env,
-                "primary_model": settings.primary_model,
-                "vector_collection": settings.vector_collection_name,
-            }
-        },
-    )
-    application.state.agent = ProductionAgent(settings)
-    logger.info("RAG API is ready")
+    application.state.agent = None
+    application.state.database_engine = None
     try:
+        logger.setLevel(settings.log_level.upper())
+        logger.info(
+            "Starting RAG API",
+            extra={
+                "extra_data": {
+                    "environment": settings.app_env,
+                    "primary_model": settings.primary_model,
+                    "vector_collection": settings.vector_collection_name,
+                }
+            },
+        )
+        application.state.agent = ProductionAgent(settings)
+        application.state.database_engine = getattr(
+            application.state.agent,
+            "db_engine",
+            None,
+        )
+        if (
+            settings.database_url is not None
+            and application.state.database_engine is None
+        ):
+            application.state.database_engine = create_database_engine(settings)
+        ensure_search_indexes = getattr(
+            application.state.agent, "ensure_search_indexes", None
+        )
+        if ensure_search_indexes is not None:
+            ensure_search_indexes()
+        if application.state.database_engine is not None:
+            application.state.document_repository = DocumentRepository(
+                application.state.database_engine,
+                tenant_id=settings.effective_tenant_id,
+            )
+        else:
+            application.state.document_repository = None
+        logger.info("RAG API is ready")
         yield
     finally:
         logger.info(
             "Shutting down RAG API",
             extra={"extra_data": application.state.metrics.get_summary()},
         )
+        agent = application.state.agent
+        agent_engine = getattr(agent, "db_engine", None)
+        if (
+            application.state.database_engine is not None
+            and application.state.database_engine is not agent_engine
+        ):
+            application.state.database_engine.dispose()
+        close_agent = getattr(agent, "close", None)
+        if close_agent is not None:
+            close_agent()
 
 
 app = FastAPI(
@@ -68,22 +131,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.state.limiter = limiter
+app.include_router(documents_router)
 
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
+    """Attach request correlation and baseline browser security headers."""
     request_id = uuid4().hex
     request.state.request_id = request_id
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
+    settings = getattr(request.app.state, "settings", None)
+    for name, value in _security_header_values(
+        production=bool(settings and settings.is_production),
+        https=request.url.scheme == "https",
+    ).items():
+        response.headers[name] = value
     return response
 
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(
     request: Request,
-    exc: RateLimitExceeded,
+    _exc: RateLimitExceeded,
 ) -> JSONResponse:
+    """Return a generic 429 response without exposing limiter internals."""
+    del _exc
     response = ErrorResponse(
         error="rate_limit_exceeded",
         detail="Too many requests. Please slow down.",
@@ -100,6 +173,7 @@ async def http_exception_handler(
     request: Request,
     exc: HTTPException,
 ) -> JSONResponse:
+    """Normalize expected HTTP errors without discarding response headers."""
     response = ErrorResponse(
         error="request_error",
         detail=str(exc.detail),
@@ -119,6 +193,7 @@ def chat(
     body: ChatRequest,
     x_chat_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> ChatResponse:
+    """Validate, cache, and answer a chat request with safe error handling."""
     settings = request.app.state.settings
     security: SecurityPipeline = request.app.state.security
     cache: ResponseCache = request.app.state.cache
@@ -155,7 +230,15 @@ def chat(
                     detail="Your message was blocked by the input checks.",
                 )
 
-            cache_key = f"{settings.vector_collection_name}\0{cleaned_message}"
+            corpus_version = ""
+            version_reader = getattr(agent, "corpus_version", None)
+            if version_reader is not None:
+                corpus_version = version_reader()
+            cache_key = (
+                f"{settings.effective_tenant_id}\0"
+                f"{settings.vector_collection_name}\0{corpus_version}"
+                f"\0{cleaned_message}"
+            )
             cached = cache.get(cache_key)
             if cached is not None:
                 cache_hit = True
@@ -249,6 +332,7 @@ def ingest_documents(
         alias="X-Ingest-API-Key",
     ),
 ) -> IngestResponse:
+    """Index bounded pre-extracted text and invalidate cached corpus answers."""
     settings = request.app.state.settings
     configured_key = settings.ingest_api_key
     if configured_key is None:
@@ -289,6 +373,25 @@ def ingest_documents(
             detail="The document service could not index this request.",
         ) from None
 
+    repository: DocumentRepository | None = (
+        request.app.state.document_repository
+    )
+    if repository is not None:
+        try:
+            repository.bump_generation()
+        except Exception:
+            logger.exception(
+                "Could not update the corpus generation after ingestion",
+                extra={
+                    "extra_data": {
+                        "request_id": request.state.request_id,
+                    }
+                },
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="The document service could not finalize this request.",
+            ) from None
     request.app.state.cache.clear()
     return IngestResponse(
         documents_received=len(body.documents),
@@ -298,11 +401,13 @@ def ingest_documents(
 
 @app.get("/health/live")
 def liveness() -> dict[str, str]:
+    """Report process liveness without requiring database or model availability."""
     return {"status": "alive"}
 
 
 @app.get("/health", response_model=HealthResponse)
 def readiness(request: Request, response: Response) -> HealthResponse:
+    """Report readiness and return 503 when the agent or database is unavailable."""
     agent = getattr(request.app.state, "agent", None)
     database_ready = agent is not None and agent.database_ready()
     checks = {
@@ -321,9 +426,146 @@ def readiness(request: Request, response: Response) -> HealthResponse:
 
 @app.get("/metrics", response_model=MetricResponse)
 def get_metrics(request: Request) -> MetricResponse:
+    """Expose the current process's request metrics."""
     return MetricResponse(**request.app.state.metrics.get_summary())
 
 
 @app.get("/cache/stats")
 def cache_stats(request: Request) -> dict[str, int]:
+    """Expose bounded in-memory response-cache statistics."""
     return request.app.state.cache.stats
+
+
+class UploadSizeLimitMiddleware:
+    """Enforce an early streaming body limit on multipart upload requests."""
+
+    def __init__(self, application: ASGIApp) -> None:
+        """Wrap the ASGI app while preserving access to its state."""
+        self.application = application
+
+    @property
+    def state(self) -> State:
+        """Expose wrapped application state for middleware compatibility."""
+        return self.application.state
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        """Reject oversized requests before multipart parsing consumes the body."""
+        if scope["type"] != "http" or scope["path"] != "/documents/upload":
+            await self.application(scope, receive, send)
+            return
+
+        maximum_body_bytes = (
+            self.application.state.settings.max_upload_bytes + 1024 * 1024
+        )
+        request_id = uuid4().hex
+        settings = self.application.state.settings
+        security_headers = _security_header_values(
+            production=bool(getattr(settings, "is_production", False)),
+            https=scope.get("scheme") == "https",
+        )
+        security_headers["X-Request-ID"] = request_id
+        content_length = next(
+            (
+                value
+                for name, value in scope["headers"]
+                if name.lower() == b"content-length"
+            ),
+            None,
+        )
+        if content_length is not None:
+            try:
+                if int(content_length) > maximum_body_bytes:
+                    await self._reject_large_upload(send, security_headers)
+                    return
+            except ValueError:
+                await self._reject_large_upload(send, security_headers)
+                return
+
+        received_bytes = 0
+        exceeded = False
+        response_started = False
+        response_body_sent = False
+
+        async def limited_receive() -> Message:
+            """Count streamed bytes and interrupt request parsing past the limit."""
+            nonlocal received_bytes, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > maximum_body_bytes:
+                    exceeded = True
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def limited_send(message: Message) -> None:
+            """Replace a partially processed oversized upload with a 413 response."""
+            nonlocal response_started, response_body_sent
+            if not exceeded:
+                await send(message)
+                return
+            if message["type"] == "http.response.start" and not response_started:
+                response_started = True
+                body = b'{"detail":"Upload request exceeds the configured limit."}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 413,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode("ascii")),
+                            *[
+                                (name.lower().encode("ascii"), value.encode("ascii"))
+                                for name, value in security_headers.items()
+                            ],
+                        ],
+                    }
+                )
+            elif message["type"] == "http.response.body" and not response_body_sent:
+                response_body_sent = True
+                body = b'{"detail":"Upload request exceeds the configured limit."}'
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": body,
+                        "more_body": False,
+                    }
+                )
+
+        await self.application(scope, limited_receive, limited_send)
+
+    @staticmethod
+    async def _reject_large_upload(
+        send: Send,
+        security_headers: dict[str, str],
+    ) -> None:
+        """Send a bounded JSON 413 response when Content-Length is already too big."""
+        body = b'{"detail":"Upload request exceeds the configured limit."}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                    *[
+                        (name.lower().encode("ascii"), value.encode("ascii"))
+                        for name, value in security_headers.items()
+                    ],
+                ],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": body,
+                "more_body": False,
+            }
+        )
+
+
+app = UploadSizeLimitMiddleware(app)

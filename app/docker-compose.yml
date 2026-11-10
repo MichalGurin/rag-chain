@@ -8,14 +8,20 @@ services:
         required: false
     environment:
       APP_ENV: development
-      DATABASE_URL: postgresql+psycopg://rag:rag@db:5432/rag
+      DATABASE_URL: "postgresql+psycopg://rag:rag@db:5432/rag"
       LLM_BASE_URL: http://ollama:11434/v1
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - uploads:/data/uploads
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
       ollama:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test:
@@ -29,6 +35,71 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 3
+    restart: unless-stopped
+
+  ingestion-worker:
+    build:
+      context: ..
+      dockerfile: app/Dockerfile
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      APP_ENV: development
+      DATABASE_URL: "postgresql+psycopg://rag:rag@db:5432/rag"
+      LLM_BASE_URL: http://ollama:11434/v1
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /data/uploads
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=2",
+        "--queues=document-ingestion",
+      ]
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      agent-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  job-dispatcher:
+    build:
+      context: ..
+      dockerfile: app/Dockerfile
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      APP_ENV: development
+      DATABASE_URL: "postgresql+psycopg://rag:rag@db:5432/rag"
+      REDIS_URL: redis://redis:6379/0
+    command:
+      [
+        "celery",
+        "-A",
+        "app.worker.celery_app",
+        "beat",
+        "--loglevel=INFO",
+        "--schedule=/tmp/celerybeat-schedule",
+      ]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      agent-api:
+        condition: service_healthy
     restart: unless-stopped
 
   db:
@@ -62,6 +133,20 @@ services:
       retries: 5
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
 volumes:
   pgdata:
   ollama:
+  redisdata:
+  uploads:
