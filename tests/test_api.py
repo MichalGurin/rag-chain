@@ -384,6 +384,7 @@ def test_service_endpoint_inventory_stays_explicit():
 
     assert service_routes == {
         ("/chat", "POST"),
+        ("/config", "GET"),
         ("/documents", "POST"),
         ("/documents/upload", "POST"),
         ("/documents/{document_id}", "GET"),
@@ -392,6 +393,14 @@ def test_service_endpoint_inventory_stays_explicit():
         ("/metrics", "GET"),
         ("/cache/stats", "GET"),
     }
+
+
+def test_config_endpoint_exposes_effective_upload_limit(api_client):
+    api_client.app.state.settings.max_upload_bytes = 123_456
+    response = api_client.get("/config")
+
+    assert response.status_code == 200
+    assert response.json()["max_upload_bytes"] == 123_456
 
 
 def test_production_https_responses_include_hsts(monkeypatch):

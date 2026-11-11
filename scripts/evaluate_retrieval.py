@@ -52,7 +52,7 @@ def main() -> None:
         retrieved = [
             [
                 str(document.metadata.get("source", "unknown"))
-                for document in agent._retrieve_documents([example["query"]])
+                for document in agent.retrieve(example["query"])
             ]
             for example in examples
         ]

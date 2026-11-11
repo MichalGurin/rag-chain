@@ -73,12 +73,9 @@ class DocumentRepository:
                 and existing["indexing_version"] == indexing_version
             ):
                 if existing["status"] == "queued":
-                    connection.execute(
-                        insert(document_outbox)
-                        .values(document_id=existing["id"])
-                        .on_conflict_do_nothing(
-                            index_elements=[document_outbox.c.document_id]
-                        )
+                    self._create_outbox_event(
+                        connection,
+                        str(existing["id"]),
                     )
                     return dict(existing), True
                 if existing["status"] in {"processing", "completed"}:

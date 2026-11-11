@@ -103,3 +103,7 @@ class ErrorResponse(BaseModel):
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+
+class ConfigResponse(BaseModel):
+    max_upload_bytes: int = 50_000_000

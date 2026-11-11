@@ -1,4 +1,4 @@
-FROM node:22-alpine
+FROM node:22-alpine AS development
 
 WORKDIR /app
 
@@ -11,3 +11,18 @@ COPY src/ ./src/
 EXPOSE 5173
 
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
+FROM development AS build
+
+RUN npm run build
+
+FROM nginx:alpine AS production
+
+ENV PORT=8080 \
+    API_PROXY_TARGET=http://agent-api:8000 \
+    NGINX_ENVSUBST_FILTER=^(PORT|API_PROXY_TARGET)$
+
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+
+EXPOSE 8080

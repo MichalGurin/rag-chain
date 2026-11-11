@@ -39,7 +39,6 @@ class ResponseCache:
         with self._lock:
             self._entries[key] = (response, expires_at)
             self._entries.move_to_end(key)
-            self._remove_expired(time.monotonic())
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)
 

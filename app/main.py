@@ -19,10 +19,11 @@ from app.api.documents import router as documents_router
 from app.api.limits import limiter
 from app.cache import CachedResponse, ResponseCache
 from app.config import get_settings
-from app.db import DocumentRepository, create_database_engine
+from app.database import DocumentRepository, create_database_engine
 from app.models import (
     ChatRequest,
     ChatResponse,
+    ConfigResponse,
     ErrorResponse,
     HealthResponse,
     IngestRequest,
@@ -434,6 +435,13 @@ def get_metrics(request: Request) -> MetricResponse:
 def cache_stats(request: Request) -> dict[str, int]:
     """Expose bounded in-memory response-cache statistics."""
     return request.app.state.cache.stats
+
+
+@app.get("/config", response_model=ConfigResponse)
+def get_config(request: Request) -> ConfigResponse:
+    """Expose effective deployment limits so clients avoid hardcoded defaults."""
+    settings = request.app.state.settings
+    return ConfigResponse(max_upload_bytes=settings.max_upload_bytes)
 
 
 class UploadSizeLimitMiddleware:

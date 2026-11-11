@@ -69,18 +69,22 @@ hosts to the internal `db` and `ollama` services. These credentials and the
 default ingestion key are for loopback/local development only.
 
 The browser workspace is a Svelte/TypeScript frontend served by the Vite
-development server in its own Docker Compose service. Open
-`http://localhost:5173` to upload documents and chat; Vite proxies API requests
-to the FastAPI service on the private Compose network. Frontend source changes
-are live-reloaded from the `frontend/` directory. The API remains available at
-`http://localhost:8000`, with interactive documentation at `/docs`. Compose
-maps PostgreSQL to `localhost:5432` for local tools.
+development server in its own Docker Compose service. Compose explicitly
+builds the Dockerfile's `development` stage, so `http://localhost:5173` retains
+hot reload and proxies API requests to FastAPI on the private Compose network.
+The default frontend Docker image instead builds the static site and serves it
+with Nginx; set `API_PROXY_TARGET` to the backend API root when running that
+image. The Render blueprint currently does not deploy a frontend service. The
+API remains available at `http://localhost:8000`, with interactive
+documentation at `/docs`. Compose maps PostgreSQL to `localhost:5432` for
+local tools.
 The bundled `rag:rag` database credentials are for local development only.
 
 To run the tests:
 
 ```powershell
 uv sync --locked --group dev
+uv run ruff check .
 uv run pytest
 ```
 
@@ -192,10 +196,12 @@ created automatically by the blueprint. Production also fails fast unless
 PostgreSQL, Redis, a non-local HTTPS LLM endpoint, `CHAT_API_KEY`, and a
 deployment-specific `TENANT_ID` are configured.
 
-Retrieval fuses BM25-ranked PostgreSQL full-text keyword candidates and pgvector
-maximal-marginal-relevance search with reciprocal-rank fusion, then reranks the
-candidates. Configure `COHERE_API_KEY` to use Cohere reranking; without it, a
-local lexical reranker keeps the default Ollama/local-LLM workflow fully
+Retrieval combines BM25-ranked PostgreSQL full-text keyword candidates and
+pgvector maximal-marginal-relevance candidates using a custom
+reciprocal-rank-style score: each result contributes `1 / (60 + rank +
+query_index)`, so later expanded queries are slightly discounted. Candidates
+are then reranked. Configure `COHERE_API_KEY` to use Cohere reranking; without
+it, a local lexical reranker keeps the default Ollama/local-LLM workflow fully
 offline. Query expansion can add alternative searches; disable
 `QUERY_EXPANSION_ENABLED` to avoid its additional model call. The number of
 rewritten queries is capped in code at `QUERY_EXPANSION_COUNT`.

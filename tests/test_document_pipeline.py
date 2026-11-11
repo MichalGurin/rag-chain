@@ -7,7 +7,7 @@ from docx import Document as WordDocument
 from fastapi import HTTPException, UploadFile
 
 from app.api.documents import _persist_upload, _upload_source
-from app.document_parser import parse_document
+from app.ingestion.parser import parse_document
 from app.main import UploadSizeLimitMiddleware
 from scripts.evaluate_retrieval import score_retrieval
 

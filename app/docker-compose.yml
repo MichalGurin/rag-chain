@@ -9,6 +9,7 @@ services:
   frontend:
     build:
       context: ../frontend
+      target: development
     command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
     environment:
       CHOKIDAR_USEPOLLING: "true"
@@ -92,7 +93,7 @@ services:
       [
         "celery",
         "-A",
-        "app.worker.celery_app",
+        "app.ingestion.tasks.celery_app",
         "worker",
         "--loglevel=INFO",
         "--concurrency=2",
@@ -128,7 +129,7 @@ services:
       [
         "celery",
         "-A",
-        "app.worker.celery_app",
+        "app.ingestion.tasks.celery_app",
         "beat",
         "--loglevel=INFO",
         "--schedule=/tmp/celerybeat-schedule",

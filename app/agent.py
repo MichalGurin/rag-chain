@@ -15,7 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, get_settings
-from app.database.engine import create_database_engine, normalize_database_url
+from app.database.engine import create_database_engine
 from app.models import DocumentInput, ParsedDocument
 from app.monitoring import get_logger
 
@@ -163,11 +163,6 @@ class ProductionAgent:
             | fallback_chat_model
             | StrOutputParser()
         )
-
-    @staticmethod
-    def _sqlalchemy_connection_string(database_url: str) -> str:
-        """Retain the legacy helper while sharing URL normalization logic."""
-        return normalize_database_url(database_url)
 
     def database_ready(self) -> bool:
         try:
@@ -317,6 +312,10 @@ class ProductionAgent:
             "model_used": model_used,
             "sources": sources,
         }
+
+    def retrieve(self, query: str) -> list[Document]:
+        """Public single-query retrieval entry point for evaluation tooling."""
+        return self._retrieve_documents([query])
 
     def _retrieve_documents(self, queries: list[str]) -> list[Document]:
         ranked_documents: dict[str, tuple[float, int, Document]] = {}

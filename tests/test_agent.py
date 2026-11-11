@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, Mock
 from langchain_core.documents import Document
 
 from app.agent import ProductionAgent
+from app.database.engine import normalize_database_url
 from app.models import DocumentInput
 from app.monitoring import get_logger
 
@@ -342,9 +343,9 @@ def test_document_ingestion_assigns_server_tenant_metadata():
 
 
 def test_database_url_schemes_are_normalized():
-    assert ProductionAgent._sqlalchemy_connection_string(
+    assert normalize_database_url(
         "postgres://user:pass@localhost/db"
     ) == "postgresql+psycopg://user:pass@localhost/db"
-    assert ProductionAgent._sqlalchemy_connection_string(
+    assert normalize_database_url(
         "postgresql://user:pass@localhost/db"
     ) == "postgresql+psycopg://user:pass@localhost/db"

@@ -1,10 +1,10 @@
 from unittest.mock import MagicMock, Mock
 
 from pydantic import SecretStr
+from sqlalchemy.dialects.postgresql import dialect
 
 from app.config import Settings
-from app.db import DocumentRepository
-from app.database import engine as database_engine
+from app.database import DocumentRepository, engine as database_engine
 
 
 def _result(row=None, *, one_or_none=None):
@@ -22,6 +22,44 @@ def _repository_with_results(results):
     engine = MagicMock()
     engine.begin.return_value.__enter__.return_value = connection
     return DocumentRepository(engine), connection
+
+
+def test_register_queued_retry_resets_existing_outbox_event():
+    existing = {
+        "id": "existing-id",
+        "source": "policy.pdf",
+        "sha256": "content-hash",
+        "indexing_version": "index-version",
+        "object_path": "uploads/existing-id.pdf",
+        "previous_object_path": None,
+        "content_type": "application/pdf",
+        "status": "queued",
+        "task_id": "existing-id",
+    }
+    repository, connection = _repository_with_results(
+        [Mock(), _result(one_or_none=existing), Mock()]
+    )
+
+    document, enqueue = repository.register(
+        document_id="new-id",
+        source="policy.pdf",
+        sha256="content-hash",
+        indexing_version="index-version",
+        object_path="uploads/new.pdf",
+        content_type="application/pdf",
+    )
+
+    statement = connection.execute.call_args_list[2].args[0]
+    compiled = statement.compile(dialect=dialect())
+    sql = str(compiled)
+    assert "ON CONFLICT (document_id) DO UPDATE" in sql
+    assert "published_at = " in sql
+    assert "locked_until = " in sql
+    assert "attempts = " in sql
+    assert list(compiled.params.values()).count(None) == 3
+    assert 0 in compiled.params.values()
+    assert document == existing
+    assert enqueue is True
 
 
 def test_register_creates_first_document_without_previous_object():

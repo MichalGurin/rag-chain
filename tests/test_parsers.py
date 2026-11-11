@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.document_parser import parse_document
+from app.ingestion.parser import parse_document
 from tests.document_samples import EXPECTED_TEXT, supported_upload_samples
 
 

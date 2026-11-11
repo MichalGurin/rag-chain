@@ -73,6 +73,26 @@ def test_frontend_proxies_api_requests_through_vite():
     assert '"/api/chat"' in app_component
 
 
+def test_frontend_production_image_builds_and_serves_the_spa():
+    frontend = ROOT / "frontend"
+    dockerfile = (frontend / "Dockerfile").read_text(encoding="utf-8")
+    nginx_template = (frontend / "nginx.conf.template").read_text(
+        encoding="utf-8"
+    )
+    compose = _read_yaml("app/docker-compose.yml")
+
+    assert "FROM node:22-alpine AS development" in dockerfile
+    assert "FROM development AS build" in dockerfile
+    assert "RUN npm run build" in dockerfile
+    assert "FROM nginx:alpine AS production" in dockerfile
+    assert "COPY --from=build /app/dist /usr/share/nginx/html" in dockerfile
+    assert (
+        compose["services"]["frontend"]["build"]["target"] == "development"
+    )
+    assert "proxy_pass ${API_PROXY_TARGET}/;" in nginx_template
+    assert "try_files $uri $uri/ /index.html;" in nginx_template
+
+
 def test_e2e_compose_services_are_loopback_bound():
     compose = _read_yaml("tests/e2e/compose.yml")
 

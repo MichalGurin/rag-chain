@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
+
   type UploadStatus =
     | "uploading"
     | "queued"
@@ -25,7 +27,7 @@
   };
 
   const allowedExtensions = new Set(["pdf", "pptx", "docx", "txt", "md"]);
-  const maxUploadBytes = 50_000_000;
+  let maxUploadBytes = $state(50_000_000);
   const threadId = globalThis.crypto?.randomUUID?.() ?? `web-${Date.now()}`;
   const suggestions = [
     "Give me a short summary of the key points.",
@@ -47,8 +49,16 @@
   let messageInput: HTMLTextAreaElement;
   let messagesElement: HTMLElement;
   let toastTimer: ReturnType<typeof setTimeout>;
+  const activeUploadControllers = new Set<AbortController>();
 
-  const documentCount = $derived(String(uploads.length).padStart(2, "0"));
+  let documentCount = $derived(String(uploads.length).padStart(2, "0"));
+
+  onDestroy(() => {
+    for (const controller of activeUploadControllers) {
+      controller.abort();
+    }
+    activeUploadControllers.clear();
+  });
 
   function errorMessage(error: unknown, fallback: string): string {
     return error instanceof Error ? error.message : fallback;
@@ -66,8 +76,26 @@
   async function responseError(response: Response): Promise<string> {
     let detail = `Request failed (${response.status}).`;
     try {
-      const body: { detail?: string; error?: string } = await response.json();
-      detail = body.detail || body.error || detail;
+      const body = (await response.json()) as {
+        detail?: unknown;
+        error?: unknown;
+      };
+      const rawDetail = body?.detail ?? body?.error;
+      if (typeof rawDetail === "string" && rawDetail) {
+        detail = rawDetail;
+      } else if (Array.isArray(rawDetail)) {
+        const messages = rawDetail
+          .map(
+            (item) =>
+              typeof item === "object" && item !== null && "msg" in item
+                ? String((item as { msg?: unknown }).msg)
+                : String(item),
+          )
+          .filter(Boolean);
+        if (messages.length) {
+          detail = messages.join("; ");
+        }
+      }
     } catch {
       return detail;
     }
@@ -101,6 +129,22 @@
     }
   }
 
+  async function loadConfig(): Promise<void> {
+    try {
+      const response = await fetch("/api/config", {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) return;
+      const config = (await response.json()) as { max_upload_bytes?: number };
+      if (typeof config.max_upload_bytes === "number" && config.max_upload_bytes > 0) {
+        maxUploadBytes = config.max_upload_bytes;
+      }
+    } catch {
+      // Keep the local default when the config endpoint is unavailable.
+    }
+  }
+
   function fileExtension(file: File): string {
     return file.name.split(".").pop()?.toLowerCase() ?? "";
   }
@@ -110,6 +154,15 @@
       return `${Math.max(1, Math.round(bytes / 1024))} KB`;
     }
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function formatUploadLimit(bytes: number): string {
+    if (bytes < 1_000_000) {
+      return `${Math.max(1, Math.round(bytes / 1000))} KB`;
+    }
+    return `${(bytes / 1_000_000).toLocaleString(undefined, {
+      maximumFractionDigits: 2,
+    })} MB`;
   }
 
   function statusLabel(status: UploadStatus): string {
@@ -123,21 +176,56 @@
     return labels[status];
   }
 
-  async function pollDocument(upload: Upload): Promise<void> {
+  function waitForPollDelay(
+    delay: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (signal.aborted) {
+        resolve(false);
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", cancel);
+        resolve(true);
+      }, delay);
+      function cancel(): void {
+        clearTimeout(timer);
+        resolve(false);
+      }
+      signal.addEventListener("abort", cancel, { once: true });
+    });
+  }
+
+  async function pollDocument(
+    upload: Upload,
+    controller: AbortController,
+  ): Promise<void> {
     let retryDelay = 2500;
     let notifiedRetry = false;
-    while (upload.status === "queued" || upload.status === "processing") {
-      await new Promise((resolve) => setTimeout(resolve, retryDelay));
+    while (
+      !controller.signal.aborted &&
+      (upload.status === "queued" || upload.status === "processing")
+    ) {
+      if (!(await waitForPollDelay(retryDelay, controller.signal))) {
+        return;
+      }
       try {
         const response = await fetch(
           `/api/documents/${encodeURIComponent(upload.documentId!)}`,
           {
             headers: ingestionHeaders(),
-            signal: AbortSignal.timeout(10000),
+            signal: AbortSignal.any([
+              controller.signal,
+              AbortSignal.timeout(10000),
+            ]),
           },
         );
+        if (controller.signal.aborted) return;
         if (!response.ok) {
           const detail = await responseError(response);
+          if (controller.signal.aborted) return;
           if (
             response.status < 500 &&
             response.status !== 408 &&
@@ -156,6 +244,7 @@
           chunks_indexed: number;
           error: string | null;
         } = await response.json();
+        if (controller.signal.aborted) return;
         upload.status = result.status;
         updateUpload(upload.id, {
           status: result.status,
@@ -165,6 +254,7 @@
         retryDelay = 2500;
         notifiedRetry = false;
       } catch (error) {
+        if (controller.signal.aborted) return;
         const detail = errorMessage(error, "Could not check upload status.");
         if (!notifiedRetry) {
           showToast(`${detail} Retrying status checks.`, true);
@@ -195,7 +285,8 @@
       return;
     }
     if (file.size > maxUploadBytes) {
-      uploadFeedback = "Files must be 50 MB or smaller.";
+      uploadFeedback =
+        `Files must be ${formatUploadLimit(maxUploadBytes)} or smaller.`;
       return;
     }
 
@@ -210,12 +301,15 @@
 
     const body = new FormData();
     body.append("file", file);
+    const controller = new AbortController();
+    activeUploadControllers.add(controller);
 
     try {
       const response = await fetch("/api/documents/upload", {
         method: "POST",
         headers: ingestionHeaders(),
         body,
+        signal: controller.signal,
       });
       if (!response.ok) {
         throw new Error(await responseError(response));
@@ -224,6 +318,7 @@
         document_id: string;
         status: UploadStatus;
       } = await response.json();
+      if (controller.signal.aborted) return;
       upload.documentId = result.document_id;
       upload.status = result.status;
       updateUpload(upload.id, {
@@ -231,14 +326,17 @@
         status: result.status,
       });
       uploadFeedback = `${file.name} uploaded. Waiting for indexing…`;
-      void pollDocument(upload);
+      await pollDocument(upload, controller);
     } catch (error) {
+      if (controller.signal.aborted) return;
       const detail = errorMessage(error, "The upload could not be completed.");
       upload.status = "failed";
       upload.error = detail;
       updateUpload(upload.id, { status: "failed", error: detail });
       uploadFeedback = detail;
       showToast(detail, true);
+    } finally {
+      activeUploadControllers.delete(controller);
     }
   }
 
@@ -260,6 +358,9 @@
     if (!question || isSending) return;
 
     message = "";
+    if (messageInput) {
+      messageInput.style.height = "auto";
+    }
     isSending = true;
     const userId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-user`;
     const replyId =
@@ -337,6 +438,7 @@
   }
 
   void checkConnection();
+  void loadConfig();
   const connectionTimer = setInterval(() => void checkConnection(), 30000);
 </script>
 
@@ -402,7 +504,9 @@
         </span>
         <span class="dropzone-title">Drop files to begin</span>
         <span class="dropzone-caption">or <span>browse files</span></span>
-        <span class="file-types">PDF, DOCX, PPTX, TXT, MD · up to 50 MB</span>
+        <span class="file-types">
+          PDF, DOCX, PPTX, TXT, MD · up to {formatUploadLimit(maxUploadBytes)}
+        </span>
       </label>
       <p class="upload-feedback" role="status" aria-live="polite">
         {uploadFeedback}

@@ -8,7 +8,11 @@ class InputSanitizer:
         r"ignore\s+(all\s+)?previous\s+instructions",
         r"forget\s+(all\s+)?previous",
         r"new\s+instructions:",
-        r"system\s*prompt",
+        r"\b(?:reveal|show|print|repeat|disclose)\s+(?:the\s+)?"
+        r"(?:hidden\s+)?(?:system|developer)\s+(?:prompt|instructions?)\b",
+        r"\b(?:disregard|override)\s+(?:all\s+)?"
+        r"(?:prior|earlier|preceding)\s+(?:system|developer)?"
+        r"(?:instructions?|directives?)\b",
         r"---\s*end\s*(of)?\s*prompt",
         r"pretend\s+you\s+are",
         r"act\s+as\s+(if\s+)?you",
@@ -34,9 +38,16 @@ class InputSanitizer:
 
 class PIIDetector:
     PATTERNS = {
-        "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
-        "credit_card": r"\b(?:\d[ -]*?){13,19}\b",
-        "phone": r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+        "ssn": r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b",
+        "credit_card": (
+            r"\b(?:\d{13,19}|"
+            r"\d{4}(?:[ -]\d{4}){2,3}(?:[ -]\d{1,3})?|"
+            r"\d{4}[ -]\d{6}[ -]\d{4,5})\b"
+        ),
+        "phone": (
+            r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"
+            r"(?:\s*(?:[eE][xX][tT]\.?|[xX])\s*\d{1,6})?\b"
+        ),
         "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
     }
 
@@ -53,16 +64,49 @@ class PIIDetector:
             for kind, pattern in self.PATTERNS.items()
         }
 
+    @staticmethod
+    def _is_valid_credit_card(value: str) -> bool:
+        digits = [int(character) for character in value if character.isdigit()]
+        if not 13 <= len(digits) <= 19:
+            return False
+
+        checksum = 0
+        parity = len(digits) % 2
+        for index, digit in enumerate(digits):
+            if index % 2 == parity:
+                digit *= 2
+                if digit > 9:
+                    digit -= 9
+            checksum += digit
+        return checksum % 10 == 0
+
     def detect(self, text: str) -> dict[str, list[str]]:
-        return {
-            kind: matches
-            for kind, pattern in self.patterns.items()
-            if (matches := pattern.findall(text))
-        }
+        found: dict[str, list[str]] = {}
+        for kind, pattern in self.patterns.items():
+            matches = pattern.findall(text)
+            if kind == "credit_card":
+                matches = [
+                    match
+                    for match in matches
+                    if self._is_valid_credit_card(match)
+                ]
+            if matches:
+                found[kind] = matches
+        return found
 
     def mask(self, text: str) -> str:
         for kind, pattern in self.patterns.items():
-            text = pattern.sub(self.MASKS[kind], text)
+            if kind == "credit_card":
+                text = pattern.sub(
+                    lambda match: (
+                        self.MASKS[kind]
+                        if self._is_valid_credit_card(match.group())
+                        else match.group()
+                    ),
+                    text,
+                )
+            else:
+                text = pattern.sub(self.MASKS[kind], text)
         return text
 
 

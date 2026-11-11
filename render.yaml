@@ -86,7 +86,7 @@ services:
     plan: starter
     dockerfilePath: ./app/Dockerfile
     dockerContext: .
-    dockerCommand: celery -A app.worker.celery_app worker --loglevel=INFO --concurrency=2 --queues=document-ingestion
+    dockerCommand: celery -A app.ingestion.tasks.celery_app worker --loglevel=INFO --concurrency=2 --queues=document-ingestion
     envVars:
       - key: APP_ENV
         value: production
@@ -143,7 +143,7 @@ services:
     plan: starter
     dockerfilePath: ./app/Dockerfile
     dockerContext: .
-    dockerCommand: celery -A app.worker.celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    dockerCommand: celery -A app.ingestion.tasks.celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
     envVars:
       - key: APP_ENV
         value: production

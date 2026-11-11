@@ -23,6 +23,10 @@ router = APIRouter()
 SUPPORTED_UPLOADS = {".pdf", ".pptx", ".docx", ".txt", ".md"}
 
 
+class UploadTooLargeError(ValueError):
+    """Raised when an upload exceeds the configured byte limit."""
+
+
 def _upload_source(filename: str | None) -> tuple[str, str]:
     """Reduce client paths to an allowed basename, rejecting empty/unknown types."""
     if not filename or "\x00" in filename:
@@ -51,7 +55,9 @@ def _persist_upload(upload: UploadFile, destination: Path, limit: int) -> str:
             while chunk := upload.file.read(1024 * 1024):
                 total_bytes += len(chunk)
                 if total_bytes > limit:
-                    raise ValueError(f"Upload exceeds the {limit}-byte limit.")
+                    raise UploadTooLargeError(
+                        f"Upload exceeds the {limit}-byte limit."
+                    )
                 if total_bytes == len(chunk):
                     suffix = destination.suffix.lower()
                     if suffix == ".pdf" and not chunk.startswith(b"%PDF-"):
@@ -205,7 +211,7 @@ async def upload_document(
         )
     except HTTPException:
         raise
-    except ValueError as exc:
+    except UploadTooLargeError as exc:
         await _cleanup_failed_upload(
             stored_path,
             object_path,
@@ -213,6 +219,14 @@ async def upload_document(
             str(document_id),
         )
         raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except ValueError as exc:
+        await _cleanup_failed_upload(
+            stored_path,
+            object_path,
+            settings,
+            str(document_id),
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
         await _cleanup_failed_upload(
             stored_path,
