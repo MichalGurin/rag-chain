@@ -1,4 +1,40 @@
 services:
+  uploads-init:
+    image: alpine:3.22
+    command: ["sh", "-c", "chown -R 10001:10001 /data/uploads"]
+    volumes:
+      - uploads:/data/uploads
+    restart: "no"
+
+  frontend:
+    build:
+      context: ../frontend
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+      API_PROXY_TARGET: http://agent-api:8000
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - ../frontend/src:/app/src
+      - ../frontend/index.html:/app/index.html
+    depends_on:
+      agent-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5173').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+
   agent-api:
     build:
       context: ..
@@ -17,6 +53,8 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
+      uploads-init:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       ollama:
@@ -63,6 +101,8 @@ services:
     volumes:
       - uploads:/data/uploads
     depends_on:
+      uploads-init:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       ollama:

@@ -99,6 +99,19 @@ class ProductionAgent:
                 ),
             ]
         )
+        general_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "Answer the user's question using your general knowledge. "
+                    "No uploaded-document context is available. Be direct and "
+                    "concise, acknowledge uncertainty when appropriate, and "
+                    "do not invent citations or imply the answer was verified "
+                    "against documents.",
+                ),
+                ("human", "Question:\n{question}"),
+            ]
+        )
         self.chat_model = ChatOpenAI(
             model=settings.primary_model,
             temperature=0,
@@ -129,16 +142,25 @@ class ProductionAgent:
             | self.chat_model
             | StrOutputParser()
         )
+        fallback_chat_model = ChatOpenAI(
+            model=settings.fallback_model,
+            temperature=0,
+            timeout=30,
+            max_retries=0,
+            api_key=api_key,
+            base_url=settings.llm_base_url,
+        )
         self.fallback_chain = (
             prompt
-            | ChatOpenAI(
-                model=settings.fallback_model,
-                temperature=0,
-                timeout=30,
-                max_retries=0,
-                api_key=api_key,
-                base_url=settings.llm_base_url,
-            )
+            | fallback_chat_model
+            | StrOutputParser()
+        )
+        self.general_chain = (
+            general_prompt | self.chat_model | StrOutputParser()
+        )
+        self.general_fallback_chain = (
+            general_prompt
+            | fallback_chat_model
             | StrOutputParser()
         )
 
@@ -159,6 +181,44 @@ class ProductionAgent:
         engine: Engine | None = getattr(self, "db_engine", None)
         if engine is not None and getattr(self, "_owns_db_engine", True):
             engine.dispose()
+
+    def _answer_from_general_knowledge(self, message: str) -> tuple[str, str]:
+        """Answer without document context and clearly label the answer."""
+        try:
+            response = self.general_chain.invoke({"question": message})
+            model_used = "primary"
+        except Exception as primary_error:
+            self.logger.warning(
+                "Primary general-knowledge model failed; trying fallback",
+                extra={
+                    "extra_data": {
+                        "error_type": type(primary_error).__name__,
+                    }
+                },
+            )
+            response = self.general_fallback_chain.invoke(
+                {"question": message}
+            )
+            model_used = "fallback"
+
+        return (
+            "I couldn't find relevant information in your documents. "
+            "Here's a general answer (not verified against your "
+            f"documents):\n\n{response}",
+            model_used,
+        )
+
+    @staticmethod
+    def _is_source_abstention(response: str) -> bool:
+        """Detect the RAG prompt's explicit no-answer response."""
+        normalized = response.casefold().replace("’", "'")
+        return bool(
+            re.search(
+                r"\bi (?:don't|do not) know based on "
+                r"(?:the )?provided sources\b",
+                normalized,
+            )
+        )
 
     def ensure_search_indexes(self) -> None:
         if getattr(self, "_fts_index_ready", False):
@@ -209,12 +269,10 @@ class ProductionAgent:
         documents = self._retrieve_documents(queries)
         context, sources = self._format_context(documents)
         if not documents:
+            response, model_used = self._answer_from_general_knowledge(message)
             return {
-                "response": (
-                    "I couldn't find relevant information in the available "
-                    "documents."
-                ),
-                "model_used": "none",
+                "response": response,
+                "model_used": model_used,
                 "sources": [],
             }
 
@@ -236,6 +294,14 @@ class ProductionAgent:
                 {"context": context, "question": message}
             )
             model_used = "fallback"
+
+        if self._is_source_abstention(response):
+            response, model_used = self._answer_from_general_knowledge(message)
+            return {
+                "response": response,
+                "model_used": model_used,
+                "sources": [],
+            }
 
         if not self._has_valid_citation_format(response, len(sources)):
             self.logger.warning(

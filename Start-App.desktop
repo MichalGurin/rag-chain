@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Local RAG Application
+Comment=Start the local document chat application
+Exec=sh -c "script_dir=$(dirname \"%k\"); cd \"$script_dir\" && exec ./start-app.sh"
+Terminal=true
+Categories=Development;

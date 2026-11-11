@@ -23,20 +23,36 @@ release; use `uv sync --locked` to install the committed lockfile.
 
 ## Local development
 
-```powershell
-Copy-Item .env.example .env
+For one-click startup, double-click `Start-App.bat` on Windows,
+`Start-App.command` on macOS, or `Start-App.desktop` on Linux. On macOS/Linux,
+make the launcher scripts executable once from a terminal:
+
+```sh
+chmod +x start-app.sh Start-App.command Start-App.desktop
 ```
 
-Start the API, ingestion worker, Redis, pgvector database, and Ollama server:
+Some Linux desktop environments may ask you to trust/allow launching the
+`.desktop` file the first time. The launchers build and start the Compose
+services, create `.env` from `.env.example` if it does not exist, download the
+default chat and embedding models only if missing, wait for the UI and API, and
+open the workspace in your browser. Docker Desktop (macOS) or the Docker
+service (Linux) must be running; the first model downloads can take several
+minutes.
+
+You can also launch from a terminal:
 
 ```powershell
-docker compose -f app/docker-compose.yml up --build
+.\start-app.ps1
 ```
 
-Download the default local chat and embedding models into the Ollama service.
-Model downloads are persisted in a Docker volume:
+```sh
+./start-app.sh
+```
+
+To start the services manually instead:
 
 ```powershell
+docker compose -f app/docker-compose.yml up --build -d
 docker compose -f app/docker-compose.yml exec ollama ollama pull llama3.2:1b
 docker compose -f app/docker-compose.yml exec ollama ollama pull nomic-embed-text
 ```
@@ -52,8 +68,13 @@ the ingestion key `local-ingest-key`. Compose overrides the database and model
 hosts to the internal `db` and `ollama` services. These credentials and the
 default ingestion key are for loopback/local development only.
 
-The API is available at `http://localhost:8000`; interactive API documentation
-is at `/docs`. Compose maps PostgreSQL to `localhost:5432` for local tools.
+The browser workspace is a Svelte/TypeScript frontend served by the Vite
+development server in its own Docker Compose service. Open
+`http://localhost:5173` to upload documents and chat; Vite proxies API requests
+to the FastAPI service on the private Compose network. Frontend source changes
+are live-reloaded from the `frontend/` directory. The API remains available at
+`http://localhost:8000`, with interactive documentation at `/docs`. Compose
+maps PostgreSQL to `localhost:5432` for local tools.
 The bundled `rag:rag` database credentials are for local development only.
 
 To run the tests:
@@ -128,11 +149,11 @@ when the key is unset there. The preferred upload API accepts PDFs, PowerPoint
 queues a job; the request does not perform parsing, embedding, or vector writes:
 
 ```powershell
-$response = Invoke-RestMethod `
-  -Method Post `
-  -Uri http://localhost:8000/documents/upload `
-  -Headers @{ "X-Ingest-API-Key" = "local-ingest-key" } `
-  -Form @{ file = Get-Item ".\handbook.pdf" }
+$response = curl.exe --fail --silent --show-error `
+  --request POST `
+  --header "X-Ingest-API-Key: local-ingest-key" `
+  --form "file=@.\handbook.pdf" `
+  http://localhost:8000/documents/upload | ConvertFrom-Json
 ```
 
 The response contains a `document_id`; poll its status (also protected by the
@@ -154,8 +175,9 @@ outbox commits each job with the document revision; a Celery Beat dispatcher
 retries broker publication and periodically recovers queued messages that were
 lost. Workers use late acknowledgements, bounded prefetch, retries, and
 per-source advisory locks.
-Uploads are size-limited, file types are allow-listed and signature-checked,
-and OOXML archives have expansion limits.
+Uploads are size-limited and extensions are allow-listed. PDF signatures and
+OOXML ZIP structure are checked; text and Markdown files must decode as UTF-8.
+OOXML archives also have entry-count and expansion limits.
 
 The JSON `POST /documents` endpoint remains available for small, already
 extracted text batches. It indexes synchronously and enforces
@@ -183,11 +205,13 @@ do not establish that a source supports a claim. This is a formatting safeguard,
 not a grounding evaluation or guarantee of factual correctness; evaluate answers
 against your corpus.
 
-`/documents/upload` enforces `MAX_UPLOAD_BYTES` (50 MB by default),
-`MAX_DOCUMENT_PAGES`, and `MAX_DOCUMENT_CHARS` (5 million extracted
-characters by default); the legacy JSON ingestion is limited to 100 documents
-and `MAX_INGEST_CHARS` total content characters per request. Both routes use
-`INGEST_RATE_LIMIT` (5 requests per minute by default) and the ingestion key.
+The upload pipeline enforces `MAX_UPLOAD_BYTES` (50 MB by default) during
+upload, then applies `MAX_DOCUMENT_PAGES` and `MAX_DOCUMENT_CHARS` (5 million
+extracted characters by default) in the worker; a file that exceeds a worker
+limit is accepted into the queue and later marked failed. The legacy JSON
+ingestion is limited to 100 documents and `MAX_INGEST_CHARS` total content
+characters per request. Both routes use `INGEST_RATE_LIMIT` (5 requests per
+minute by default) and the ingestion key.
 
 ## Retrieval evaluation
 
@@ -223,6 +247,11 @@ processing time. `thread_id` is a caller-provided correlation value only; this
 starter does not persist conversational history. The in-memory response cache
 and rate limits are per process and are not shared across replicas. Set
 `CACHE_TTL_SECONDS=0` to disable response caching.
+When retrieval finds no documents, or the document-grounded model abstains
+because it cannot answer from its sources, the API answers using the model's
+general knowledge instead. It labels this answer as unverified against the
+uploaded documents and returns no document sources; use it for general
+guidance, not as a substitute for a sourced answer.
 
 ## Deployment
 

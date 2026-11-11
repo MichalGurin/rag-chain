@@ -15,8 +15,26 @@ def test_compose_separates_api_worker_dispatcher_and_dependencies():
     compose = _read_yaml("app/docker-compose.yml")
     services = compose["services"]
 
-    assert {"agent-api", "ingestion-worker", "job-dispatcher"} <= services.keys()
+    assert {
+        "frontend",
+        "uploads-init",
+        "agent-api",
+        "ingestion-worker",
+        "job-dispatcher",
+    } <= services.keys()
     assert {"db", "redis", "ollama"} <= services.keys()
+    assert services["frontend"]["build"]["context"] == "../frontend"
+    assert services["frontend"]["ports"] == ["127.0.0.1:5173:5173"]
+    assert services["frontend"]["depends_on"]["agent-api"][
+        "condition"
+    ] == "service_healthy"
+    assert services["uploads-init"]["volumes"] == ["uploads:/data/uploads"]
+    assert services["agent-api"]["depends_on"]["uploads-init"][
+        "condition"
+    ] == "service_completed_successfully"
+    assert services["ingestion-worker"]["depends_on"]["uploads-init"][
+        "condition"
+    ] == "service_completed_successfully"
     assert services["ingestion-worker"]["command"][-1] == (
         "--queues=document-ingestion"
     )
@@ -33,6 +51,26 @@ def test_compose_publishes_only_loopback_ports():
     for service in compose["services"].values():
         for port in service.get("ports", []):
             assert str(port).startswith("127.0.0.1:")
+
+
+def test_frontend_proxies_api_requests_through_vite():
+    frontend = ROOT / "frontend"
+    compose = _read_yaml("app/docker-compose.yml")
+    package = (frontend / "package.json").read_text(encoding="utf-8")
+    vite_config = (frontend / "vite.config.ts").read_text(encoding="utf-8")
+    app_component = (frontend / "src" / "App.svelte").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"svelte"' in package
+    assert '"/api"' in vite_config
+    assert "API_PROXY_TARGET" in vite_config
+    assert (
+        compose["services"]["frontend"]["environment"]["API_PROXY_TARGET"]
+        == "http://agent-api:8000"
+    )
+    assert '"/api/documents/upload"' in app_component
+    assert '"/api/chat"' in app_component
 
 
 def test_e2e_compose_services_are_loopback_bound():

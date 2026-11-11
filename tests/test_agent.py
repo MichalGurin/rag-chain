@@ -20,6 +20,8 @@ def make_agent():
     agent.query_rewriter = Mock()
     agent.primary_chain = Mock()
     agent.fallback_chain = Mock()
+    agent.general_chain = Mock()
+    agent.general_fallback_chain = Mock()
     agent.logger = get_logger("test-agent")
     return agent
 
@@ -149,15 +151,68 @@ def test_keyword_search_scopes_sql_query_to_configured_tenant():
     assert parameters["tenant_id"] == "tenant-a"
 
 
-def test_empty_retrieval_abstains_without_calling_the_llm():
+def test_empty_retrieval_answers_from_general_knowledge_without_citations():
     agent = make_agent()
     agent.vector_store.max_marginal_relevance_search.return_value = []
+    agent.general_chain.invoke.return_value = "Ottawa is the capital of Canada."
 
-    result = agent.invoke("What does the handbook say?")
+    result = agent.invoke("What is the capital of Canada?")
 
-    assert result["model_used"] == "none"
+    assert result["model_used"] == "primary"
     assert result["sources"] == []
+    assert result["response"] == (
+        "I couldn't find relevant information in your documents. "
+        "Here's a general answer (not verified against your documents):\n\n"
+        "Ottawa is the capital of Canada."
+    )
+    agent.general_chain.invoke.assert_called_once_with(
+        {"question": "What is the capital of Canada?"}
+    )
     agent.primary_chain.invoke.assert_not_called()
+    agent.general_fallback_chain.invoke.assert_not_called()
+
+
+def test_empty_retrieval_uses_general_fallback_after_primary_failure():
+    agent = make_agent()
+    agent.vector_store.max_marginal_relevance_search.return_value = []
+    agent.general_chain.invoke.side_effect = RuntimeError("primary unavailable")
+    agent.general_fallback_chain.invoke.return_value = "Ottawa."
+
+    result = agent.invoke("What is the capital of Canada?")
+
+    assert result["model_used"] == "fallback"
+    assert result["sources"] == []
+    assert result["response"].endswith("Ottawa.")
+    agent.general_fallback_chain.invoke.assert_called_once_with(
+        {"question": "What is the capital of Canada?"}
+    )
+
+
+def test_source_abstention_falls_back_to_general_knowledge():
+    agent = make_agent()
+    agent.vector_store.max_marginal_relevance_search.return_value = [
+        Document(
+            page_content="The office plant is called Fern.",
+            metadata={"source": "office-notes"},
+        )
+    ]
+    agent.primary_chain.invoke.return_value = (
+        "I don't know based on the provided sources. [1]"
+    )
+    agent.general_chain.invoke.return_value = (
+        "Photosynthesis converts light into chemical energy."
+    )
+
+    result = agent.invoke("What is photosynthesis?")
+
+    assert result["model_used"] == "primary"
+    assert result["sources"] == []
+    assert "general answer" in result["response"]
+    assert "not verified against your documents" in result["response"]
+    assert "Photosynthesis converts light" in result["response"]
+    agent.general_chain.invoke.assert_called_once_with(
+        {"question": "What is photosynthesis?"}
+    )
 
 
 def test_query_expansion_retrieves_with_original_and_rewritten_questions():
