@@ -16,12 +16,12 @@ def _result(row=None, *, one_or_none=None):
     return result
 
 
-def _repository_with_results(results):
+def _repository_with_results(results, *, tenant_id="local"):
     connection = Mock()
     connection.execute.side_effect = results
     engine = MagicMock()
     engine.begin.return_value.__enter__.return_value = connection
-    return DocumentRepository(engine), connection
+    return DocumentRepository(engine, tenant_id=tenant_id), connection
 
 
 def test_register_queued_retry_resets_existing_outbox_event():
@@ -155,6 +155,20 @@ def test_document_status_lookup_is_scoped_to_repository_tenant():
 
     statement = connection.execute.call_args.args[0]
     assert statement.compile().params["tenant_id_1"] == "tenant-a"
+
+
+def test_corpus_generation_upsert_is_scoped_to_repository_tenant():
+    repository, connection = _repository_with_results(
+        [Mock()],
+        tenant_id="tenant-a",
+    )
+
+    repository.bump_generation()
+
+    statement = connection.execute.call_args.args[0]
+    compiled = statement.compile(dialect=dialect())
+    assert "ON CONFLICT (tenant_id) DO UPDATE" in str(compiled)
+    assert "tenant-a" in compiled.params.values()
 
 
 def test_database_engine_uses_normalized_url_and_configured_timeouts(monkeypatch):

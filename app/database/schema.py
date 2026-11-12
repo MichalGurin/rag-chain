@@ -59,7 +59,7 @@ document_outbox = Table(
 index_generation = Table(
     "rag_index_generation",
     metadata,
-    Column("id", Integer, primary_key=True),
+    Column("tenant_id", String(128), primary_key=True),
     Column("revision", Integer, nullable=False),
     Column(
         "updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()

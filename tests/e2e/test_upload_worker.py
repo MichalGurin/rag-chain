@@ -181,7 +181,8 @@ def test_upload_is_processed_by_a_real_celery_worker(
         with engine.connect() as connection:
             generation = connection.execute(
                 select(index_generation.c.revision).where(
-                    index_generation.c.id == 1
+                    index_generation.c.tenant_id
+                    == settings.effective_tenant_id
                 )
             ).scalar_one()
             pending_events = connection.execute(

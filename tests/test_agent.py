@@ -152,6 +152,20 @@ def test_keyword_search_scopes_sql_query_to_configured_tenant():
     assert parameters["tenant_id"] == "tenant-a"
 
 
+def test_corpus_version_reads_only_the_configured_tenant():
+    agent = ProductionAgent.__new__(ProductionAgent)
+    agent.tenant_id = "tenant-a"
+    agent.db_engine = MagicMock()
+    connection = agent.db_engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value.scalar_one.return_value = "7"
+
+    assert agent.corpus_version() == "7"
+
+    statement, parameters = connection.execute.call_args.args
+    assert "tenant_id = :tenant_id" in str(statement)
+    assert parameters == {"tenant_id": "tenant-a"}
+
+
 def test_empty_retrieval_answers_from_general_knowledge_without_citations():
     agent = make_agent()
     agent.vector_store.max_marginal_relevance_search.return_value = []

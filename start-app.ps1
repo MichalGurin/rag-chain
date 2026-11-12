@@ -14,6 +14,37 @@ function Invoke-Compose {
     }
 }
 
+function Get-DotEnvValue {
+    param(
+        [string]$Name,
+        [string]$DefaultValue
+    )
+
+    $pattern = '^\s*' + [regex]::Escape($Name) + '\s*=\s*(.*?)\s*$'
+    $value = $null
+    foreach ($line in Get-Content (Join-Path $PSScriptRoot ".env")) {
+        if ($line -match $pattern) {
+            $value = $Matches[1].Trim()
+        }
+    }
+
+    if (
+        $value -and
+        $value.Length -ge 2 -and
+        (
+            ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+            ($value.StartsWith("'") -and $value.EndsWith("'"))
+        )
+    ) {
+        $value = $value.Substring(1, $value.Length - 2)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return $DefaultValue
+    }
+    return $value
+}
+
 function Wait-ForEndpoint {
     param(
         [string]$Url,
@@ -68,15 +99,25 @@ try {
     }
 
     $requiredModels = @(
-        @{ Name = "llama3.2:1b"; Pattern = '(?m)^llama3\.2:1b\s' },
-        @{ Name = "nomic-embed-text"; Pattern = '(?m)^nomic-embed-text(?::latest)?\s' }
+        (Get-DotEnvValue -Name "PRIMARY_MODEL" -DefaultValue "llama3.2:1b"),
+        (Get-DotEnvValue -Name "FALLBACK_MODEL" -DefaultValue "llama3.2:1b"),
+        (Get-DotEnvValue -Name "EMBEDDING_MODEL" -DefaultValue "nomic-embed-text")
     )
-    foreach ($model in $requiredModels) {
-        if (($modelList -join "`n") -notmatch $model.Pattern) {
-            Write-Host "Downloading required model $($model.Name) (first launch may take a while)..."
-            Invoke-Compose -ComposeArguments @("exec", "-T", "ollama", "ollama", "pull", $model.Name)
+    $installedModels = @(
+        $modelList |
+            Select-Object -Skip 1 |
+            ForEach-Object { ($_ -join " ").Trim() -split '\s+' | Select-Object -First 1 }
+    )
+    foreach ($model in ($requiredModels | Select-Object -Unique)) {
+        if ([string]::IsNullOrWhiteSpace($model)) {
+            throw "Model names in .env must not be empty."
+        }
+        $latestModel = if ($model.Contains(":")) { $model } else { "$($model):latest" }
+        if (($installedModels -contains $model) -or ($installedModels -contains $latestModel)) {
+            Write-Host "Model $model is already installed."
         } else {
-            Write-Host "Model $($model.Name) is already installed."
+            Write-Host "Downloading required model $model (first launch may take a while)..."
+            Invoke-Compose -ComposeArguments @("exec", "-T", "ollama", "ollama", "pull", $model)
         }
     }
 

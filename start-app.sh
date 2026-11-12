@@ -31,6 +31,51 @@ compose() {
     docker compose -f "$COMPOSE_FILE" "$@"
 }
 
+dotenv_value() {
+    name=$1
+    default_value=$2
+    value=$(awk -v key="$name" '
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            sub(/^[^=]*=/, "")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            if ((substr($0, 1, 1) == "\"" && substr($0, length($0), 1) == "\"") ||
+                (substr($0, 1, 1) == "\047" && substr($0, length($0), 1) == "\047")) {
+                $0 = substr($0, 2, length($0) - 2)
+            }
+            value = $0
+        }
+        END { if (value != "") print value }
+    ' "$SCRIPT_DIR/.env")
+    if [ -z "$value" ]; then
+        value=$default_value
+    fi
+    printf '%s' "$value"
+}
+
+ensure_model() {
+    model=$1
+    if [ -z "$model" ]; then
+        echo "Model names in .env must not be empty." >&2
+        exit 1
+    fi
+
+    model_list=$(compose exec -T ollama ollama list)
+    installed_models=$(printf '%s\n' "$model_list" | awk 'NR > 1 {print $1}')
+    latest_model=$model
+    case "$model" in
+        *:*) ;;
+        *) latest_model="${model}:latest" ;;
+    esac
+
+    if printf '%s\n' "$installed_models" | grep -F -x -e "$model" >/dev/null ||
+        printf '%s\n' "$installed_models" | grep -F -x -e "$latest_model" >/dev/null; then
+        echo "Model $model is already installed."
+    else
+        echo "Downloading required model $model (first launch may take a while)..."
+        compose exec -T ollama ollama pull "$model"
+    fi
+}
+
 echo "Building and starting the application..."
 compose up --build --detach
 
@@ -44,19 +89,14 @@ while ! model_list=$(compose exec -T ollama ollama list 2>/dev/null); do
     sleep 5
 done
 
-if ! printf '%s\n' "$model_list" | grep -Eq '^llama3\.2:1b([[:space:]]|$)'; then
-    echo "Downloading required model llama3.2:1b (first launch may take a while)..."
-    compose exec -T ollama ollama pull llama3.2:1b
-else
-    echo "Model llama3.2:1b is already installed."
+primary_model=$(dotenv_value PRIMARY_MODEL llama3.2:1b)
+fallback_model=$(dotenv_value FALLBACK_MODEL llama3.2:1b)
+embedding_model=$(dotenv_value EMBEDDING_MODEL nomic-embed-text)
+ensure_model "$primary_model"
+if [ "$fallback_model" != "$primary_model" ]; then
+    ensure_model "$fallback_model"
 fi
-
-if ! printf '%s\n' "$model_list" | grep -Eq '^nomic-embed-text(:latest)?([[:space:]]|$)'; then
-    echo "Downloading required model nomic-embed-text (first launch may take a while)..."
-    compose exec -T ollama ollama pull nomic-embed-text
-else
-    echo "Model nomic-embed-text is already installed."
-fi
+ensure_model "$embedding_model"
 
 wait_for_endpoint() {
     url=$1

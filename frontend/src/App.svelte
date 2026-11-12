@@ -50,10 +50,12 @@
   let messagesElement: HTMLElement;
   let toastTimer: ReturnType<typeof setTimeout>;
   const activeUploadControllers = new Set<AbortController>();
+  const connectionTimer = setInterval(() => void checkConnection(), 30000);
 
   let documentCount = $derived(String(uploads.length).padStart(2, "0"));
 
   onDestroy(() => {
+    clearInterval(connectionTimer);
     for (const controller of activeUploadControllers) {
       controller.abort();
     }
@@ -439,7 +441,6 @@
 
   void checkConnection();
   void loadConfig();
-  const connectionTimer = setInterval(() => void checkConnection(), 30000);
 </script>
 
 <div class="workspace">

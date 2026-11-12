@@ -325,10 +325,13 @@ class DocumentRepository:
         return published
 
     def bump_generation(self) -> None:
-        """Increment the shared corpus revision after successful indexing."""
-        statement = insert(index_generation).values(id=1, revision=1)
+        """Increment this tenant's corpus revision after successful indexing."""
+        statement = insert(index_generation).values(
+            tenant_id=self.tenant_id,
+            revision=1,
+        )
         statement = statement.on_conflict_do_update(
-            index_elements=[index_generation.c.id],
+            index_elements=[index_generation.c.tenant_id],
             set_={
                 "revision": index_generation.c.revision + 1,
                 "updated_at": func.now(),

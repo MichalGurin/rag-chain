@@ -653,7 +653,8 @@ class ProductionAgent:
             version = connection.execute(
                 text(
                     "SELECT coalesce(max(revision)::text, '0') "
-                    "FROM rag_index_generation"
-                )
+                    "FROM rag_index_generation WHERE tenant_id = :tenant_id"
+                ),
+                {"tenant_id": self.tenant_id},
             ).scalar_one()
         return str(version)

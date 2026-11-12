@@ -212,8 +212,11 @@ not a grounding evaluation or guarantee of factual correctness; evaluate answers
 against your corpus.
 
 The upload pipeline enforces `MAX_UPLOAD_BYTES` (50 MB by default) during
-upload, then applies `MAX_DOCUMENT_PAGES` and `MAX_DOCUMENT_CHARS` (5 million
-extracted characters by default) in the worker; a file that exceeds a worker
+upload, then applies `MAX_DOCUMENT_PAGES` to PDF pages and PowerPoint slides,
+and `MAX_DOCUMENT_CHARS` (5 million extracted characters by default) to all
+supported formats in the worker. DOCX, Markdown, and plain-text files do not
+have a reliable page count in this parser, so the page limit does not constrain
+them; use the character limit for those formats. A file that exceeds a worker
 limit is accepted into the queue and later marked failed. The legacy JSON
 ingestion is limited to 100 documents and `MAX_INGEST_CHARS` total content
 characters per request. Both routes use `INGEST_RATE_LIMIT` (5 requests per
@@ -317,10 +320,11 @@ metrics, not a replacement for a production metrics backend.
   set. This implementation does not provide GraphRAG, multimodal indexing, or
   late chunking; add those only when the corpus and evaluation show they help.
 - The response cache and rate limiter are in-memory. Cache keys include a
-  PostgreSQL corpus generation so successful indexing bypasses stale answers,
-  but rate limits are process-local. Use a shared cache and rate-limit backend
-  with identity-aware keys when scaling horizontally or serving personalized
-  answers. Rate limits use the client address; configure `FORWARDED_ALLOW_IPS`
+  tenant-scoped PostgreSQL corpus generation, so successful indexing bypasses
+  stale answers without invalidating other tenants. Rate limits remain
+  process-local. Use a shared cache and rate-limit backend with identity-aware
+  keys when scaling horizontally or serving personalized answers. Rate limits
+  use the client address; configure `FORWARDED_ALLOW_IPS`
   with only the deployment's trusted proxy ranges so requests are not all
   attributed to the proxy or spoofed by untrusted forwarded headers.
 - LangSmith tracing is not configured by the application. If you enable it
