@@ -11,6 +11,8 @@ services:
         value: production
       - key: LOG_LEVEL
         value: INFO
+      - key: LANGSMITH_TRACING
+        value: "false"
       - key: RATE_LIMIT
         value: "20/minute"
       - key: INGEST_RATE_LIMIT
@@ -92,6 +94,8 @@ services:
         value: production
       - key: LOG_LEVEL
         value: INFO
+      - key: LANGSMITH_TRACING
+        value: "false"
       - key: DATABASE_URL
         sync: false
       - key: REDIS_URL

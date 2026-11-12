@@ -10,6 +10,7 @@ from fastapi import (
     Response,
 )
 from fastapi.responses import JSONResponse
+from langsmith import tracing_context
 from starlette.datastructures import State
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from slowapi.errors import RateLimitExceeded
@@ -80,6 +81,13 @@ async def lifespan(application: FastAPI):
                     "environment": settings.app_env,
                     "primary_model": settings.primary_model,
                     "vector_collection": settings.vector_collection_name,
+                    "langsmith_tracing": settings.langsmith_tracing,
+                    "langsmith_project": settings.effective_langsmith_project,
+                    "langsmith_sampling_rate": (
+                        settings.langsmith_tracing_sampling_rate
+                    ),
+                    "langsmith_hide_inputs": settings.langsmith_hide_inputs,
+                    "langsmith_hide_outputs": settings.langsmith_hide_outputs,
                 }
             },
         )
@@ -247,7 +255,18 @@ def chat(
                 sources = list(cached.sources)
                 model_used = cached.model_used
             else:
-                result = agent.invoke(cleaned_message)
+                trace_metadata = {
+                    "request_id": request.state.request_id,
+                    "environment": settings.app_env,
+                    "tenant_id": settings.effective_tenant_id,
+                }
+                if body.thread_id:
+                    trace_metadata["thread_id"] = body.thread_id
+                with tracing_context(
+                    tags=["api", "chat"],
+                    metadata=trace_metadata,
+                ):
+                    result = agent.invoke(cleaned_message)
                 response_text, output_warnings = security.check_output(
                     result["response"]
                 )

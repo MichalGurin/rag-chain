@@ -2,6 +2,7 @@
 
 from celery import Celery
 from celery.app.task import Task
+from langsmith import traceable
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -52,6 +53,15 @@ celery_app.conf.update(
     autoretry_for=(SQLAlchemyError,),
     retry_backoff=True,
     retry_backoff_max=60,
+)
+@traceable(
+    name="document.index",
+    run_type="chain",
+    tags=["worker", "ingestion"],
+    metadata={
+        "environment": settings.app_env,
+        "tenant_id": settings.effective_tenant_id,
+    },
 )
 def process_document(self, document_id: str) -> dict[str, int | str]:
     """Index the current revision; ignore stale IDs and retry transient failures."""

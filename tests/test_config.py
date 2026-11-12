@@ -1,7 +1,22 @@
+import os
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from app.config import Settings
+from app.config import Settings, configure_langsmith_tracing
+
+
+def clear_langsmith_environment(monkeypatch):
+    for name in (
+        "LANGSMITH_TRACING",
+        "LANGSMITH_API_KEY",
+        "LANGSMITH_PROJECT",
+        "LANGSMITH_ENDPOINT",
+        "LANGSMITH_TRACING_SAMPLING_RATE",
+        "LANGSMITH_HIDE_INPUTS",
+        "LANGSMITH_HIDE_OUTPUTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_production_requires_chat_api_key():
@@ -67,6 +82,73 @@ def test_local_llm_defaults_need_no_provider_api_key():
         "postgresql+psycopg://rag:rag@localhost:5432/rag"
     )
     assert settings.effective_tenant_id == "local"
+
+
+def test_langsmith_tracing_is_opt_in_and_hides_payloads_by_default(monkeypatch):
+    clear_langsmith_environment(monkeypatch)
+    settings = Settings(_env_file=None)
+
+    assert settings.langsmith_tracing is False
+    assert settings.langsmith_hide_inputs is True
+    assert settings.langsmith_hide_outputs is True
+    assert settings.effective_langsmith_project == "prod-rag-development"
+
+
+def test_langsmith_configuration_is_exported_to_sdk_environment(monkeypatch):
+    clear_langsmith_environment(monkeypatch)
+    settings = Settings(
+        _env_file=None,
+        langsmith_tracing=True,
+        langsmith_api_key=SecretStr("test-langsmith-key"),
+        langsmith_tracing_sampling_rate=0.25,
+    )
+    monkeypatch.setenv("LANGSMITH_ENDPOINT", "https://old.example.com")
+
+    configure_langsmith_tracing(settings)
+
+    assert os.environ["LANGSMITH_TRACING"] == "true"
+    assert os.environ["LANGSMITH_API_KEY"] == "test-langsmith-key"
+    assert os.environ["LANGSMITH_PROJECT"] == "prod-rag-development"
+    assert os.environ["LANGSMITH_TRACING_SAMPLING_RATE"] == "0.25"
+    assert os.environ["LANGSMITH_HIDE_INPUTS"] == "true"
+    assert os.environ["LANGSMITH_HIDE_OUTPUTS"] == "true"
+    assert "LANGSMITH_ENDPOINT" not in os.environ
+
+
+def test_disabling_langsmith_clears_stale_api_credentials(monkeypatch):
+    clear_langsmith_environment(monkeypatch)
+    monkeypatch.setenv("LANGSMITH_API_KEY", "stale-key")
+    settings = Settings(_env_file=None, langsmith_api_key=None)
+
+    configure_langsmith_tracing(settings)
+
+    assert os.environ["LANGSMITH_TRACING"] == "false"
+    assert "LANGSMITH_API_KEY" not in os.environ
+
+
+def test_langsmith_tracing_requires_api_key(monkeypatch):
+    clear_langsmith_environment(monkeypatch)
+    with pytest.raises(ValidationError, match="LANGSMITH_API_KEY"):
+        Settings(_env_file=None, langsmith_tracing=True)
+
+
+def test_production_langsmith_endpoint_requires_https(monkeypatch):
+    clear_langsmith_environment(monkeypatch)
+    with pytest.raises(ValidationError, match="LANGSMITH_ENDPOINT must use HTTPS"):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            chat_api_key=SecretStr("test-key"),
+            tenant_id="tenant-a",
+            database_url=SecretStr("postgresql+psycopg://db/rag"),
+            redis_url=SecretStr("redis://redis:6379/0"),
+            llm_base_url="https://llm.example.com/v1",
+            s3_endpoint_url="https://s3.example.com",
+            s3_bucket="documents",
+            s3_access_key_id=SecretStr("test-access"),
+            s3_secret_access_key=SecretStr("test-secret"),
+            langsmith_endpoint="http://smith.example.com",
+        )
 
 
 def test_local_http_model_endpoint_is_allowed():

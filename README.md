@@ -80,6 +80,25 @@ documentation at `/docs`. Compose maps PostgreSQL to `localhost:5432` for
 local tools.
 The bundled `rag:rag` database credentials are for local development only.
 
+## LangSmith tracing
+
+LangSmith tracing is opt-in. To enable traces for the API and document
+ingestion worker, set `LANGSMITH_TRACING=true` and provide `LANGSMITH_API_KEY`
+as a secret in each process environment. The API key is required when tracing
+is enabled; missing credentials fail configuration validation at startup.
+`LANGSMITH_PROJECT` optionally selects a project (otherwise the project is
+`prod-rag-<APP_ENV>`), and `LANGSMITH_ENDPOINT` can select a regional LangSmith
+endpoint. `LANGSMITH_TRACING_SAMPLING_RATE` accepts a value from `0` to `1`.
+
+Trace inputs and outputs are hidden by default to avoid sending questions,
+answers, or retrieved document text to LangSmith. Set
+`LANGSMITH_HIDE_INPUTS=false` and/or `LANGSMITH_HIDE_OUTPUTS=false` only after
+reviewing your data-handling requirements. API traces include request,
+environment, tenant, and optional thread correlation metadata; indexing jobs
+are traced as separate runs. Cached chat responses do not invoke the RAG chain
+and therefore do not create a LangSmith trace. Ordinary application logs never
+include the LangSmith API key.
+
 To run the tests:
 
 ```powershell

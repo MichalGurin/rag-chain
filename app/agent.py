@@ -11,6 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_postgres import PGVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langsmith import traceable
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -234,6 +235,7 @@ class ProductionAgent:
             )
         self._fts_index_ready = True
 
+    @traceable(name="rag.invoke", run_type="chain")
     def invoke(self, message: str) -> dict[str, Any]:
         queries = [message]
         if self.query_expansion_enabled:

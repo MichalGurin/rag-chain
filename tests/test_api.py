@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -74,6 +75,30 @@ def test_chat_returns_sources_and_caches_response(api_client):
     assert second.json()["model_used"] == "primary"
     assert api_client.get("/metrics").json()["total_requests"] == 2
     assert api_client.get("/cache/stats").json()["entries"] == 1
+
+
+def test_chat_adds_correlation_metadata_to_langsmith_context(
+    api_client,
+    monkeypatch,
+):
+    trace_context = Mock(side_effect=lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(main, "tracing_context", trace_context)
+
+    response = api_client.post(
+        "/chat",
+        json={"message": "How many leave days?", "thread_id": "test-thread"},
+    )
+
+    assert response.status_code == 200
+    trace_context.assert_called_once()
+    options = trace_context.call_args.kwargs
+    assert options["tags"] == ["api", "chat"]
+    assert options["metadata"] == {
+        "request_id": response.headers["X-Request-ID"],
+        "environment": "development",
+        "tenant_id": "local",
+        "thread_id": "test-thread",
+    }
 
 
 def test_ingestion_requires_key_and_indexes_documents(api_client):

@@ -1,4 +1,5 @@
 import hashlib
+import os
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -44,6 +45,17 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     log_level: str = "INFO"
+    langsmith_tracing: bool = False
+    langsmith_api_key: SecretStr | None = None
+    langsmith_project: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+    )
+    langsmith_endpoint: str | None = None
+    langsmith_tracing_sampling_rate: float = Field(default=1.0, ge=0, le=1)
+    langsmith_hide_inputs: bool = True
+    langsmith_hide_outputs: bool = True
     rate_limit: str = "20/minute"
     ingest_rate_limit: str = "5/minute"
     max_ingest_chars: int = Field(default=250_000, ge=1, le=5_000_000)
@@ -63,6 +75,16 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_tenant_id(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+    @field_validator("langsmith_project")
+    @classmethod
+    def normalize_langsmith_project(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        project = value.strip()
+        if not project:
+            raise ValueError("LANGSMITH_PROJECT must not be blank")
+        return project
 
     @model_validator(mode="after")
     def validate_settings(self) -> "Settings":
@@ -90,6 +112,16 @@ class Settings(BaseSettings):
             )
         if self.is_production and self.chat_api_key is None:
             raise ValueError("CHAT_API_KEY is required in production")
+        if self.langsmith_tracing and self.langsmith_api_key is None:
+            raise ValueError(
+                "LANGSMITH_API_KEY is required when LANGSMITH_TRACING is enabled"
+            )
+        if (
+            self.is_production
+            and self.langsmith_endpoint
+            and urlparse(self.langsmith_endpoint).scheme != "https"
+        ):
+            raise ValueError("LANGSMITH_ENDPOINT must use HTTPS in production")
         if (
             self.is_production
             and self.s3_endpoint_url
@@ -167,8 +199,42 @@ class Settings(BaseSettings):
         )
         return hashlib.sha256(version.encode("utf-8")).hexdigest()
 
+    @property
+    def effective_langsmith_project(self) -> str:
+        """Separate traces by environment unless a project is explicitly set."""
+        return self.langsmith_project or f"prod-rag-{self.app_env.lower()}"
+
 
 @lru_cache
 def get_settings() -> Settings:
     """Load and cache environment configuration once per process."""
-    return Settings()
+    settings = Settings()
+    configure_langsmith_tracing(settings)
+    return settings
+
+
+def configure_langsmith_tracing(settings: Settings) -> None:
+    """Set LangSmith's supported environment-based tracing configuration."""
+    os.environ["LANGSMITH_TRACING"] = str(settings.langsmith_tracing).lower()
+    os.environ["LANGSMITH_PROJECT"] = settings.effective_langsmith_project
+    os.environ["LANGSMITH_TRACING_SAMPLING_RATE"] = str(
+        settings.langsmith_tracing_sampling_rate
+    )
+    os.environ["LANGSMITH_HIDE_INPUTS"] = str(
+        settings.langsmith_hide_inputs
+    ).lower()
+    os.environ["LANGSMITH_HIDE_OUTPUTS"] = str(
+        settings.langsmith_hide_outputs
+    ).lower()
+
+    if settings.langsmith_api_key is not None:
+        os.environ["LANGSMITH_API_KEY"] = (
+            settings.langsmith_api_key.get_secret_value()
+        )
+    else:
+        os.environ.pop("LANGSMITH_API_KEY", None)
+
+    if settings.langsmith_endpoint:
+        os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint
+    else:
+        os.environ.pop("LANGSMITH_ENDPOINT", None)
