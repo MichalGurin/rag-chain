@@ -1,10 +1,11 @@
-# Production RAG starter
+# Production ready RAG chain
 
 A single-collection retrieval-augmented chat API built with FastAPI, LangChain,
 an OpenAI-compatible local LLM endpoint, and PostgreSQL/pgvector. It provides
 asynchronous document uploads, a Redis/Celery ingestion worker, hybrid
-keyword/vector retrieval, reranking, source-aware answers, API-key protection,
-rate limiting, health checks, and structured logs. It is intended as a
+keyword/vector retrieval, reranking, source-aware answers with a model-based
+evidence check for potential hallucination or drift, API-key protection, rate
+limiting, health checks, and structured logs. It is intended as a
 starting point: each deployment uses one server-configured tenant namespace.
 Add your application's user identity, per-user authorization, retention, and
 evaluation policies before exposing it to users.
@@ -224,11 +225,17 @@ it, a local lexical reranker keeps the default Ollama/local-LLM workflow fully
 offline. Query expansion can add alternative searches; disable
 `QUERY_EXPANSION_ENABLED` to avoid its additional model call. The number of
 rewritten queries is capped in code at `QUERY_EXPANSION_COUNT`.
-`MAX_CONTEXT_CHARS` bounds the prompt context. Citation checks validate only
-that answers contain citation markers within the retrieved-source range; they
-do not establish that a source supports a claim. This is a formatting safeguard,
-not a grounding evaluation or guarantee of factual correctness; evaluate answers
-against your corpus.
+`MAX_CONTEXT_CHARS` bounds the prompt context. Citation checks validate that
+answers contain citation markers within the retrieved-source range. A separate
+model-based check compares factual claims with retrieved evidence and checks
+whether the answer addresses the question. It reports `supported`,
+`potential_drift`, or `unverified` as `grounding_status` in the chat response.
+Answers assessed as supported are returned as document-grounded answers.
+Invalid citations and detected drift fall back to a clearly labeled
+general-knowledge answer with no document sources. Inconclusive checks keep
+the retrieved answer and sources but mark them unverified, unless answer terms
+and the question topic co-occur in the cited source text. The check is a signal,
+not a guarantee of factual correctness. Evaluate answers against your corpus.
 
 The upload pipeline enforces `MAX_UPLOAD_BYTES` (50 MB by default) during
 upload, then applies `MAX_DOCUMENT_PAGES` to PDF pages and PowerPoint slides,
@@ -270,11 +277,12 @@ Invoke-RestMethod `
   -Body '{"message":"How many days of annual leave do employees receive?","thread_id":"demo"}'
 ```
 
-Responses include source labels, the selected model, cache status, and request
-processing time. `thread_id` is a caller-provided correlation value only; this
-starter does not persist conversational history. The in-memory response cache
-and rate limits are per process and are not shared across replicas. Set
-`CACHE_TTL_SECONDS=0` to disable response caching.
+Responses include source labels, the selected model, the `grounding_status`
+evidence-check result, cache status, and request processing time. `thread_id`
+is a caller-provided correlation value only; this starter does not persist
+conversational history. The in-memory response cache and rate limits are per
+process and are not shared across replicas. Set `CACHE_TTL_SECONDS=0` to
+disable response caching.
 When retrieval finds no documents, or the document-grounded model abstains
 because it cannot answer from its sources, the API answers using the model's
 general knowledge instead. It labels this answer as unverified against the

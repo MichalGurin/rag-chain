@@ -17,11 +17,14 @@
     error?: string;
   };
 
+  type GroundingStatus = "supported" | "potential_drift" | "unverified";
+
   type ChatMessage = {
     id: string;
     role: "user" | "assistant";
     text: string;
     sources?: string[];
+    groundingStatus?: GroundingStatus;
     loading?: boolean;
     error?: boolean;
   };
@@ -355,6 +358,14 @@
     );
   }
 
+  function isGroundingStatus(value: unknown): value is GroundingStatus {
+    return (
+      value === "supported" ||
+      value === "potential_drift" ||
+      value === "unverified"
+    );
+  }
+
   async function sendMessage(prompt = message): Promise<void> {
     const question = prompt.trim();
     if (!question || isSending) return;
@@ -392,13 +403,20 @@
       if (!response.ok) {
         throw new Error(await responseError(response));
       }
-      const result: { response: string; sources: string[] } =
+      const result: {
+        response: string;
+        sources: string[];
+        grounding_status?: unknown;
+      } =
         await response.json();
       updateMessage(replyId, {
         text: result.response,
         sources: Array.isArray(result.sources)
           ? result.sources.map(String)
           : [],
+        groundingStatus: isGroundingStatus(result.grounding_status)
+          ? result.grounding_status
+          : "unverified",
         loading: false,
       });
     } catch (error) {
@@ -717,6 +735,19 @@
                     {entry.text}
                   {/if}
                 </div>
+                {#if entry.role === "assistant" && !entry.loading && !entry.error}
+                  <p
+                    class="grounding-status"
+                    data-status={entry.groundingStatus ?? "unverified"}
+                    aria-label="Answer evidence check"
+                  >
+                    {entry.groundingStatus === "supported"
+                      ? "Evidence check: appears supported"
+                      : entry.groundingStatus === "potential_drift"
+                        ? "Document answer drift detected; using general knowledge"
+                        : "Not verified against documents"}
+                  </p>
+                {/if}
                 {#if entry.sources?.length}
                   <div class="message-sources">
                     {#each entry.sources as source}

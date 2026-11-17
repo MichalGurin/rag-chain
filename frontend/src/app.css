@@ -794,6 +794,20 @@ button {
   color: #354538;
 }
 
+.grounding-status {
+  margin: 7px 0 0;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.grounding-status[data-status="supported"] {
+  color: var(--green);
+}
+
+.grounding-status[data-status="potential_drift"] {
+  color: var(--amber);
+}
+
 .message-row.is-error .message-bubble {
   border-color: #f0d9d5;
   background: #fff8f6;

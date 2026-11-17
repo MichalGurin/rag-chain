@@ -4,12 +4,15 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from app.models import GroundingStatus
+
 
 @dataclass(frozen=True)
 class CachedResponse:
     response: str
     sources: tuple[str, ...]
     model_used: str
+    grounding_status: GroundingStatus = "unverified"
 
 
 class ResponseCache:

@@ -3,7 +3,12 @@ from app.cache import CachedResponse, ResponseCache
 
 def test_cache_returns_unexpired_response_and_evicts_oldest():
     cache = ResponseCache(ttl_seconds=60, max_entries=1)
-    first = CachedResponse("answer one", ("source one",), "primary")
+    first = CachedResponse(
+        "answer one",
+        ("source one",),
+        "primary",
+        "potential_drift",
+    )
     second = CachedResponse("answer two", ("source two",), "fallback")
 
     cache.set("question one", first)

@@ -37,6 +37,7 @@ class FakeAgent:
             "response": "Employees receive 20 days [1].",
             "model_used": "primary",
             "sources": ["handbook/leave-policy"],
+            "grounding_status": "supported",
         }
 
     def ingest_documents(self, documents):
@@ -70,9 +71,11 @@ def test_chat_returns_sources_and_caches_response(api_client):
     assert first.status_code == 200
     assert first.headers["X-Request-ID"]
     assert first.json()["sources"] == ["handbook/leave-policy"]
+    assert first.json()["grounding_status"] == "supported"
     assert first.json()["cached"] is False
     assert second.json()["cached"] is True
     assert second.json()["model_used"] == "primary"
+    assert second.json()["grounding_status"] == "supported"
     assert api_client.get("/metrics").json()["total_requests"] == 2
     assert api_client.get("/cache/stats").json()["entries"] == 1
 
@@ -570,6 +573,8 @@ def test_chat_integrates_retrieval_citations_and_response_validation(monkeypatch
         },
     )()
     agent.fallback_chain = None
+    agent.grounding_chain = Mock()
+    agent.grounding_chain.invoke.return_value = "SUPPORTED"
     agent.logger = main.logger
     monkeypatch.setattr(main, "ProductionAgent", lambda _settings: agent)
 

@@ -1,7 +1,11 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+
+GroundingStatus = Literal["supported", "potential_drift", "unverified"]
 
 
 class ChatRequest(BaseModel):
@@ -25,6 +29,7 @@ class ChatResponse(BaseModel):
     thread_id: str = "default"
     model_used: str
     sources: list[str] = Field(default_factory=list)
+    grounding_status: GroundingStatus = "unverified"
     cached: bool = False
     processing_time_ms: float = 0.0
 

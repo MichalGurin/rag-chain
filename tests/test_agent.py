@@ -23,6 +23,8 @@ def make_agent():
     agent.fallback_chain = Mock()
     agent.general_chain = Mock()
     agent.general_fallback_chain = Mock()
+    agent.grounding_chain = Mock()
+    agent.grounding_chain.invoke.return_value = "SUPPORTED"
     agent.logger = get_logger("test-agent")
     return agent
 
@@ -43,6 +45,7 @@ def test_agent_retrieves_context_and_returns_source_labels():
         "response": "Employees receive 20 days [1].",
         "model_used": "primary",
         "sources": ["handbook/leave-policy"],
+        "grounding_status": "supported",
     }
     agent.vector_store.max_marginal_relevance_search.assert_called_once_with(
         "How many leave days?",
@@ -175,6 +178,7 @@ def test_empty_retrieval_answers_from_general_knowledge_without_citations():
 
     assert result["model_used"] == "primary"
     assert result["sources"] == []
+    assert result["grounding_status"] == "unverified"
     assert result["response"] == (
         "I couldn't find relevant information in your documents. "
         "Here's a general answer (not verified against your documents):\n\n"
@@ -197,6 +201,7 @@ def test_empty_retrieval_uses_general_fallback_after_primary_failure():
 
     assert result["model_used"] == "fallback"
     assert result["sources"] == []
+    assert result["grounding_status"] == "unverified"
     assert result["response"].endswith("Ottawa.")
     agent.general_fallback_chain.invoke.assert_called_once_with(
         {"question": "What is the capital of Canada?"}
@@ -212,7 +217,8 @@ def test_source_abstention_falls_back_to_general_knowledge():
         )
     ]
     agent.primary_chain.invoke.return_value = (
-        "I don't know based on the provided sources. [1]"
+        'There is no information in the context. The correct answer is '
+        '"I don\'t know" based on the provided sources.'
     )
     agent.general_chain.invoke.return_value = (
         "Photosynthesis converts light into chemical energy."
@@ -268,19 +274,196 @@ def test_query_expansion_failure_continues_with_original_question():
     )
 
 
-def test_invalid_citations_are_replaced_with_abstention():
+def test_invalid_citations_fall_back_to_general_knowledge():
     agent = make_agent()
     agent.vector_store.max_marginal_relevance_search.return_value = [
         Document(page_content="Known fact.", metadata={"source": "source-a"})
     ]
     agent.primary_chain.invoke.return_value = "Unsupported answer [2]."
+    agent.general_chain.invoke.return_value = "A general answer."
 
     result = agent.invoke("What is the fact?")
 
-    assert result["response"].startswith(
-        "I couldn't produce an answer with valid source citations"
+    assert "A general answer." in result["response"]
+    assert result["sources"] == []
+    assert result["grounding_status"] == "unverified"
+    agent.general_chain.invoke.assert_called_once_with(
+        {"question": "What is the fact?"}
     )
-    assert result["sources"] == ["source-a"]
+
+
+def test_grounding_check_flags_unsupported_answers():
+    agent = make_agent()
+    agent.vector_store.max_marginal_relevance_search.return_value = [
+        Document(
+            page_content="The policy grants 20 days.",
+            metadata={"source": "guide"},
+        )
+    ]
+    agent.primary_chain.invoke.return_value = "The policy grants 30 days [1]."
+    agent.grounding_chain.invoke.return_value = "DRIFT"
+    agent.general_chain.invoke.return_value = "A general answer."
+
+    result = agent.invoke("How many days?")
+
+    assert result["grounding_status"] == "potential_drift"
+    assert result["sources"] == []
+    assert "A general answer." in result["response"]
+    assert "The policy grants 30 days" not in result["response"]
+    agent.grounding_chain.invoke.assert_called_once()
+    assert (
+        agent.grounding_chain.invoke.call_args.args[0]["question"]
+        == "How many days?"
+    )
+
+
+def test_grounding_check_failure_marks_answer_unverified():
+    agent = make_agent()
+    agent.vector_store.max_marginal_relevance_search.return_value = [
+        Document(
+            page_content="The policy grants 20 days.",
+            metadata={"source": "guide"},
+        )
+    ]
+    agent.primary_chain.invoke.return_value = "The policy grants 20 days [1]."
+    agent.grounding_chain.invoke.side_effect = RuntimeError("judge unavailable")
+    agent.general_chain.invoke.return_value = "A general answer."
+
+    result = agent.invoke("How many days?")
+
+    assert result["grounding_status"] == "unverified"
+    assert result["sources"] == ["guide"]
+    assert result["response"] == "The policy grants 20 days [1]."
+    agent.general_chain.invoke.assert_not_called()
+
+
+def test_grounding_check_rejects_unexpected_verdicts():
+    agent = make_agent()
+    agent.grounding_chain.invoke.return_value = "Maybe"
+
+    assert agent._check_grounding(
+        "Question?",
+        "An answer [1].",
+        "Evidence.",
+    ) == "unverified"
+
+
+def test_grounding_check_accepts_punctuated_verdict():
+    agent = make_agent()
+    agent.grounding_chain.invoke.return_value = (
+        "The answer is SUPPORTED because the evidence states the same fact."
+    )
+
+    assert agent._check_grounding(
+        "Question?",
+        "An answer [1].",
+        "Evidence.",
+    ) == "supported"
+
+
+def test_grounding_check_does_not_accept_negated_supported_verdict():
+    agent = make_agent()
+    agent.grounding_chain.invoke.return_value = (
+        "The answer is not supported by the evidence."
+    )
+
+    assert agent._check_grounding(
+        "Question?",
+        "An answer [1].",
+        "Evidence.",
+    ) == "unverified"
+
+
+def test_grounding_check_accepts_answer_stated_verbatim_in_relevant_context():
+    agent = make_agent()
+    agent.grounding_chain.invoke.return_value = "UNCERTAIN"
+    response = "The capital of Burkina Faso is Ouagadougou [1]."
+    context = (
+        "[1] Source: capital.txt\n"
+        "The capital of Burkina Faso is Ouagadougou."
+    )
+
+    assert agent._check_grounding(
+        "What is the capital of Burkina Faso?",
+        response,
+        context,
+    ) == "supported"
+
+
+def test_direct_evidence_overrides_false_drift_verdict():
+    agent = make_agent()
+    agent.vector_store.max_marginal_relevance_search.return_value = [
+        Document(
+            page_content="Country: Burkina Faso\nCapital: Ouagadougou.",
+            metadata={"source": "capital.txt"},
+        )
+    ]
+    agent.primary_chain.invoke.return_value = "Ouagadougou [1]."
+    agent.grounding_chain.invoke.return_value = "DRIFT"
+
+    result = agent.invoke("What is the capital of Burkina Faso?")
+
+    assert result["response"] == "Ouagadougou [1]."
+    assert result["sources"] == ["capital.txt"]
+    assert result["grounding_status"] == "supported"
+    agent.general_chain.invoke.assert_not_called()
+
+
+def test_grounding_check_accepts_short_answer_stated_in_relevant_context():
+    agent = make_agent()
+    agent.grounding_chain.invoke.return_value = "UNCERTAIN"
+
+    assert agent._check_grounding(
+        "What is the capital of Burkina Faso?",
+        "Ouagadougou [1].",
+        "[1] Source: capital.txt\n"
+        "The capital of Burkina Faso is Ouagadougou.",
+    ) == "supported"
+
+
+def test_grounding_check_accepts_tp_link_app_answer_from_manual():
+    agent = make_agent()
+    agent.grounding_chain.invoke.return_value = "UNCERTAIN"
+
+    assert agent._check_grounding(
+        "What is the mobile app used for repeater extender TP-Link?",
+        "The mobile app used for repeater extender TP-Link is called "
+        "TP-Link Tether [1].",
+        "[1] Source: repeater-manual.pdf\n"
+        "TP-Link Tether is the mobile app for configuring TP-Link range "
+        "extenders.",
+    ) == "supported"
+
+
+def test_direct_evidence_does_not_support_an_unrelated_question():
+    assert not ProductionAgent._is_directly_stated(
+        "What is the capital of Gambia?",
+        "The capital of Burkina Faso is Ouagadougou [1].",
+        "[1] Source: capital.txt\n"
+        "The capital of Burkina Faso is Ouagadougou.",
+    )
+
+
+def test_direct_evidence_must_be_in_a_cited_source_section():
+    assert not ProductionAgent._is_directly_stated(
+        "What is the capital of Burkina Faso?",
+        "Ouagadougou [1].",
+        "[1] Source: unrelated.txt\n"
+        "A general note.\n"
+        "[2] Source: capital.txt\n"
+        "Country: Burkina Faso\nCapital: Ouagadougou.",
+    )
+
+
+def test_grounding_check_marks_uncertain_verdict_unverified():
+    agent = make_agent()
+    agent.grounding_chain.invoke.return_value = "UNCERTAIN"
+
+    assert agent._check_grounding(
+        "Question?",
+        "An answer [1].",
+        "Evidence.",
+    ) == "unverified"
 
 
 def test_citation_format_does_not_claim_to_verify_grounding():

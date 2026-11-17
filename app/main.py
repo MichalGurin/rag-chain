@@ -254,6 +254,7 @@ def chat(
                 response_text = cached.response
                 sources = list(cached.sources)
                 model_used = cached.model_used
+                grounding_status = cached.grounding_status
             else:
                 trace_metadata = {
                     "request_id": request.state.request_id,
@@ -273,12 +274,17 @@ def chat(
                 security_notes.extend(output_warnings)
                 sources = result.get("sources", [])
                 model_used = result["model_used"]
+                grounding_status = result.get(
+                    "grounding_status",
+                    "unverified",
+                )
                 cache.set(
                     cache_key,
                     CachedResponse(
                         response=response_text,
                         sources=tuple(sources),
                         model_used=model_used,
+                        grounding_status=grounding_status,
                     ),
                 )
     except HTTPException as exc:
@@ -337,6 +343,7 @@ def chat(
         thread_id=body.thread_id,
         model_used=model_used,
         sources=sources,
+        grounding_status=grounding_status,
         cached=cache_hit,
         processing_time_ms=round(timer.elapsed_ms, 2),
     )
