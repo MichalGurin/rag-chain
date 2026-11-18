@@ -133,11 +133,29 @@ def test_render_blueprint_has_api_worker_dispatcher_and_redis():
 
 def test_local_compose_uses_development_defaults_and_plain_http_ollama():
     compose = _read_yaml("app/docker-compose.yml")
+    services = compose["services"]
+    model_init = services["ollama-model-init"]
 
     for service_name in ("agent-api", "ingestion-worker"):
-        environment = compose["services"][service_name]["environment"]
+        service = services[service_name]
+        environment = service["environment"]
         assert environment["APP_ENV"] == "development"
         assert environment["LLM_BASE_URL"] == "http://ollama:11434/v1"
+        assert service["depends_on"]["ollama-model-init"]["condition"] == (
+            "service_completed_successfully"
+        )
+
+    assert model_init["entrypoint"] == ["/bin/sh", "-ec"]
+    assert model_init["environment"]["OLLAMA_HOST"] == "http://ollama:11434"
+    assert "ollama pull \"$${PRIMARY_MODEL}\"" in model_init["command"][0]
+    assert "ollama pull \"$${EMBEDDING_MODEL}\"" in model_init["command"][0]
+
+    assert 'Invoke-Compose -ComposeArguments @("wait", "ollama-model-init")' in (
+        (ROOT / "start-app.ps1").read_text(encoding="utf-8")
+    )
+    assert "compose wait ollama-model-init" in (
+        (ROOT / "start-app.sh").read_text(encoding="utf-8")
+    )
 
 
 def test_production_image_uses_pinned_uv_and_non_root_runtime():

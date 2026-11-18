@@ -50,6 +50,7 @@ def _persist_upload(upload: UploadFile, destination: Path, limit: int) -> str:
     """Stream and validate one file, rejecting oversize, empty, or bomb archives."""
     digest = hashlib.sha256()
     total_bytes = 0
+    first_chunk = True
     with upload.file:
         with destination.open("xb") as target:
             while chunk := upload.file.read(1024 * 1024):
@@ -58,12 +59,13 @@ def _persist_upload(upload: UploadFile, destination: Path, limit: int) -> str:
                     raise UploadTooLargeError(
                         f"Upload exceeds the {limit}-byte limit."
                     )
-                if total_bytes == len(chunk):
+                if first_chunk:
                     suffix = destination.suffix.lower()
                     if suffix == ".pdf" and not chunk.startswith(b"%PDF-"):
                         raise ValueError("The uploaded file is not a valid PDF.")
                     if suffix in {".pptx", ".docx"} and not chunk.startswith(b"PK"):
                         raise ValueError("The uploaded Office file is invalid.")
+                    first_chunk = False
                 digest.update(chunk)
                 target.write(chunk)
     if total_bytes == 0:

@@ -60,6 +60,8 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+      ollama-model-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     healthcheck:
@@ -108,6 +110,8 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+      ollama-model-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       agent-api:
@@ -173,6 +177,26 @@ services:
       start_period: 20s
       retries: 5
     restart: unless-stopped
+
+  ollama-model-init:
+    image: ollama/ollama:latest
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ollama pull "$${PRIMARY_MODEL}"
+        if [ "$${FALLBACK_MODEL}" != "$${PRIMARY_MODEL}" ]; then
+          ollama pull "$${FALLBACK_MODEL}"
+        fi
+        ollama pull "$${EMBEDDING_MODEL}"
+    environment:
+      PRIMARY_MODEL: "${PRIMARY_MODEL:-llama3.2:1b}"
+      FALLBACK_MODEL: "${FALLBACK_MODEL:-llama3.2:1b}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-nomic-embed-text}"
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
 
   redis:
     image: redis:7-alpine

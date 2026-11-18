@@ -54,9 +54,12 @@ To start the services manually instead:
 
 ```powershell
 docker compose -f app/docker-compose.yml up --build -d
-docker compose -f app/docker-compose.yml exec ollama ollama pull llama3.2:1b
-docker compose -f app/docker-compose.yml exec ollama ollama pull nomic-embed-text
 ```
+
+Compose downloads the configured chat and embedding models before starting the
+API and ingestion worker. The first startup can take several minutes; model
+names can be changed with `PRIMARY_MODEL`, `FALLBACK_MODEL`, and
+`EMBEDDING_MODEL` in `.env`.
 
 The default settings use Ollama's OpenAI-compatible `/v1` API. No OpenAI
 account or API key is needed. The application supplies the compatibility

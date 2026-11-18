@@ -78,6 +78,7 @@ ensure_model() {
 
 echo "Building and starting the application..."
 compose up --build --detach
+compose wait ollama-model-init
 
 echo "Waiting for Ollama..."
 deadline=$(( $(date +%s) + 300 ))

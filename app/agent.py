@@ -2,6 +2,8 @@ from collections import Counter
 import hashlib
 import math
 import re
+import threading
+import time
 from typing import Any
 
 import httpx
@@ -19,6 +21,127 @@ from app.config import Settings, get_settings
 from app.database.engine import create_database_engine
 from app.models import DocumentInput, GroundingStatus, ParsedDocument
 from app.monitoring import get_logger
+
+
+class CircuitBreakerOpen(Exception):
+    """Raised when the circuit breaker is open and the call should be skipped."""
+
+
+class CircuitBreaker:
+    """Thread-safe circuit breaker with closed/open/half-open states.
+
+    Opens after *failure_threshold* consecutive failures.
+    Stays open for *recovery_timeout* seconds, then allows one trial request.
+    Only one caller is permitted through the half-open state at a time; other
+    callers are rejected until the probe succeeds and the circuit closes.
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        recovery_timeout: float = 60.0,
+    ) -> None:
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._lock = threading.Lock()
+        self._state = "closed"  # closed | open | half-open
+        self._consecutive_failures = 0
+        self._opened_at: float | None = None
+        self._half_open_permit = False
+        self._probe_id: int | None = None  # thread-id that owns the permit
+
+    # -- public API ---------------------------------------------------------
+
+    def call(self, func, *args, **kwargs):
+        """Invoke *func*; skip with CircuitBreakerOpen when the circuit is open."""
+        self._before_call()
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
+        return result
+
+    def record_success(self) -> None:
+        """Mark the last call as successful (caller-managed pattern)."""
+        self._force_close()
+
+    def record_failure(self) -> None:
+        """Mark the last call as failed (caller-managed pattern)."""
+        self._record_failure()
+
+    # -- internal -----------------------------------------------------------
+
+    def _before_call(self) -> None:
+        """Gate a call. Returns only for the caller that may proceed."""
+        with self._lock:
+            if self._state == "closed":
+                return
+            if self._state == "open":
+                if (
+                    self._opened_at is not None
+                    and time.monotonic() - self._opened_at >= self._recovery_timeout
+                ):
+                    if self._half_open_permit:
+                        raise CircuitBreakerOpen("Primary model circuit is open")
+                    # Claim permit and record which thread owns it
+                    self._state = "half-open"
+                    self._half_open_permit = True
+                    self._probe_id = threading.get_ident()
+                    return
+                raise CircuitBreakerOpen("Primary model circuit is open")
+            # half-open: only the probe thread may proceed
+            if self._probe_id != threading.get_ident():
+                raise CircuitBreakerOpen(
+                    "Primary model circuit is half-open; probe in progress"
+                )
+
+    def _record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+            if self._state == "half-open" and self._probe_id == threading.get_ident():
+                self._state = "closed"
+            self._opened_at = None
+            self._half_open_permit = False
+            self._probe_id = None
+
+    def _force_close(self) -> None:
+        """Public API: reset circuit to closed regardless of state."""
+        with self._lock:
+            self._consecutive_failures = 0
+            self._state = "closed"
+            self._opened_at = None
+            self._half_open_permit = False
+            self._probe_id = None
+
+    def _record_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            self._half_open_permit = False
+            if self._state == "half-open":
+                self._probe_id = None
+                self._state = "open"
+                self._opened_at = time.monotonic()
+            elif self._consecutive_failures >= self._failure_threshold:
+                self._state = "open"
+                self._opened_at = time.monotonic()
+
+
+class _NoopCircuit:
+    """Pass-through circuit breaker used as a fallback for test doubles."""
+
+    @staticmethod
+    def call(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    @staticmethod
+    def record_success():
+        pass
+
+    @staticmethod
+    def record_failure():
+        pass
 
 
 class ProductionAgent:
@@ -80,6 +203,11 @@ class ProductionAgent:
             ],
         )
         self.logger = get_logger()
+
+        self._llm_circuit_instance = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout=60.0,
+        )
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -208,11 +336,30 @@ class ProductionAgent:
         if engine is not None and getattr(self, "_owns_db_engine", True):
             engine.dispose()
 
+    @property
+    def _llm_circuit(self) -> CircuitBreaker:
+        """Lazy circuit breaker; falls back to a pass-through for test doubles."""
+        cb = getattr(self, "_llm_circuit_instance", None)
+        if cb is not None:
+            return cb
+        return _NoopCircuit()  # type: ignore[return-value]
+
     def _answer_from_general_knowledge(self, message: str) -> tuple[str, str]:
         """Answer without document context and clearly label the answer."""
         try:
-            response = self.general_chain.invoke({"question": message})
+            response = self._llm_circuit.call(
+                self.general_chain.invoke,
+                {"question": message},
+            )
             model_used = "primary"
+        except CircuitBreakerOpen:
+            self.logger.warning(
+                "Primary model circuit is open; using general-knowledge fallback",
+            )
+            response = self.general_fallback_chain.invoke(
+                {"question": message}
+            )
+            model_used = "fallback"
         except Exception as primary_error:
             self.logger.warning(
                 "Primary general-knowledge model failed; trying fallback",
@@ -270,11 +417,12 @@ class ProductionAgent:
         queries = [message]
         if self.query_expansion_enabled:
             try:
-                rewrites = self.query_rewriter.invoke(
+                rewrites = self._llm_circuit.call(
+                    self.query_rewriter.invoke,
                     {
                         "question": message,
                         "query_count": self.query_expansion_count,
-                    }
+                    },
                 )
                 queries.extend(
                     self._parse_rewritten_queries(
@@ -305,10 +453,19 @@ class ProductionAgent:
             }
 
         try:
-            response = self.primary_chain.invoke(
-                {"context": context, "question": message}
+            response = self._llm_circuit.call(
+                self.primary_chain.invoke,
+                {"context": context, "question": message},
             )
             model_used = "primary"
+        except CircuitBreakerOpen:
+            self.logger.warning(
+                "Primary model circuit is open; trying fallback",
+            )
+            response = self.fallback_chain.invoke(
+                {"context": context, "question": message}
+            )
+            model_used = "fallback"
         except Exception as primary_error:
             self.logger.warning(
                 "Primary chat model failed; trying fallback",

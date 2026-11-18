@@ -83,6 +83,7 @@ try {
 
     Write-Host "Building and starting the application..."
     Invoke-Compose -ComposeArguments @("up", "--build", "--detach")
+    Invoke-Compose -ComposeArguments @("wait", "ollama-model-init")
 
     Write-Host "Waiting for Ollama..."
     $deadline = (Get-Date).AddMinutes(5)
