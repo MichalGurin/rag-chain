@@ -98,6 +98,30 @@ def test_local_llm_defaults_need_no_provider_api_key():
     assert settings.effective_tenant_id == "local"
 
 
+def test_llm_cost_guardrails_have_sensible_defaults():
+    settings = Settings(_env_file=None)
+
+    assert settings.max_estimated_llm_cost_per_request_usd == 0.05
+    assert settings.max_total_llm_cost_usd is None
+
+
+def test_llm_cost_guardrails_read_environment_overrides(monkeypatch):
+    monkeypatch.setenv("MAX_ESTIMATED_LLM_COST_PER_REQUEST_USD", "0.5")
+    monkeypatch.setenv("MAX_TOTAL_LLM_COST_USD", "12.5")
+    settings = Settings(_env_file=None)
+
+    assert settings.max_estimated_llm_cost_per_request_usd == 0.5
+    assert settings.max_total_llm_cost_usd == 12.5
+
+
+def test_llm_cost_guardrail_limits_are_validated():
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        Settings(_env_file=None, max_estimated_llm_cost_per_request_usd=-0.01)
+
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        Settings(_env_file=None, max_total_llm_cost_usd=-1.0)
+
+
 def test_langsmith_tracing_is_opt_in(monkeypatch):
     clear_langsmith_environment(monkeypatch)
     settings = Settings(_env_file=None)

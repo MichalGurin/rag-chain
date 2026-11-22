@@ -335,6 +335,32 @@ general knowledge instead. It labels this answer as unverified against the
 uploaded documents and returns no document sources; use it for general
 guidance, not as a substitute for a sourced answer.
 
+## LLM cost and token tracking
+
+The API tracks LLM token usage and estimated spend for every chat,
+query-expansion, grounding, and general-knowledge call. Usage is read from the
+LangChain chat-model completion events and folded into a per-process cost
+tracker; spend is estimated from per-million-token pricing until a provider
+reports usage.
+
+Two runaway-cost guardrails protect the deployment:
+
+- `MAX_ESTIMATED_LLM_COST_PER_REQUEST_USD` (default `0.05`) caps the estimated
+  spend of a single LLM call. Estimates use the configured prompt/context size
+  and a conservative output-token budget, so oversized answers or context-heavy
+  retrievals are refused before the call runs.
+- `MAX_TOTAL_LLM_COST_USD` (blank by default) caps cumulative spend per process.
+  Once exceeded, further LLM calls are blocked for the process lifetime.
+
+When a guardrail trips, the API skips the blocked LLM call and returns a safe
+answer that explains the limit instead of issuing another provider request.
+The limit applies per process, not per tenant; set the budget for your expected
+workload and provider pricing.
+
+Token and cost totals are exposed on `GET /metrics` through the `llm_*` fields
+(`llm_calls`, `llm_input_tokens`, `llm_output_tokens`, `llm_total_tokens`, and
+`llm_estimated_cost_usd`).
+
 ## Deployment
 
 The repository includes a Render Blueprint in `render.yaml` (API, worker,

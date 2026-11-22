@@ -68,6 +68,15 @@ class FakeAgent:
         self.documents.extend(documents)
         return len(documents) * 2
 
+    def get_llm_usage_summary(self) -> dict[str, float | int]:
+        return {
+            "llm_calls": 0,
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
+            "llm_total_tokens": 0,
+            "llm_estimated_cost_usd": 0.0,
+        }
+
 
 @pytest.fixture
 def api_client(monkeypatch):
@@ -540,6 +549,18 @@ class FakeDocumentRepository:
         return len(queued)
 
 
+def test_metrics_include_llm_cost_tracking(api_client):
+    response = api_client.get("/metrics")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["llm_calls"] == 0
+    assert body["llm_input_tokens"] == 0
+    assert body["llm_output_tokens"] == 0
+    assert body["llm_total_tokens"] == 0
+    assert body["llm_estimated_cost_usd"] == 0.0
+
+
 def test_readiness_checks_database(api_client):
     response = api_client.get("/health")
 
@@ -745,6 +766,8 @@ def test_chat_integrates_retrieval_citations_and_response_validation(monkeypatch
     agent.max_context_chars = 1200
     agent.query_expansion_enabled = False
     agent.query_expansion_count = 2
+    agent.primary_model_name = "gpt-4o-mini"
+    agent.fallback_model_name = "gpt-4o-mini"
     agent.query_rewriter = None
     agent.primary_chain = type(
         "AnswerChain",

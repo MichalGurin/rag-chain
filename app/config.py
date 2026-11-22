@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     cohere_api_key: SecretStr | None = None
     rerank_model: str = "rerank-v3.5"
     rerank_candidates_k: int = Field(default=30, ge=1, le=100)
+    max_estimated_llm_cost_per_request_usd: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=100.0,
+    )
+    max_total_llm_cost_usd: float | None = Field(default=None, ge=0.0)
 
     app_env: str = "development"
     log_level: str = "INFO"

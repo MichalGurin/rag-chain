@@ -485,8 +485,13 @@ def readiness(request: Request, response: Response) -> HealthResponse:
 
 @app.get("/metrics", response_model=MetricResponse)
 def get_metrics(request: Request) -> MetricResponse:
-    """Expose the current process's request metrics."""
-    return MetricResponse(**request.app.state.metrics.get_summary())
+    """Expose the current process's request and LLM cost metrics."""
+    summary = request.app.state.metrics.get_summary()
+    agent = getattr(request.app.state, "agent", None)
+    llm_usage: dict[str, int | float] = {}
+    if agent is not None:
+        llm_usage = agent.get_llm_usage_summary()
+    return MetricResponse(**{**summary, **llm_usage})
 
 
 @app.get("/cache/stats")

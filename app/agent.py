@@ -4,7 +4,8 @@ import math
 import re
 import threading
 import time
-from typing import Any
+from functools import partial
+from typing import Any, Callable
 
 import httpx
 from langchain_core.documents import Document
@@ -26,6 +27,12 @@ from app.config import (
     record_langsmith_feedback,
 )
 from app.database.engine import create_database_engine
+from app.llm_cost import (
+    LLMCostLimitExceeded,
+    LLMCostTracker,
+    TokenUsageCallback,
+    estimate_tokens,
+)
 from app.models import DocumentInput, GroundingStatus, ParsedDocument
 from app.monitoring import get_logger
 
@@ -204,6 +211,8 @@ class ProductionAgent:
         self.max_context_chars = settings.max_context_chars
         self.query_expansion_enabled = settings.query_expansion_enabled
         self.query_expansion_count = settings.query_expansion_count
+        self.primary_model_name = settings.primary_model
+        self.fallback_model_name = settings.fallback_model
         self.rerank_candidates_k = settings.rerank_candidates_k
         self.cohere_api_key = (
             settings.cohere_api_key.get_secret_value()
@@ -231,6 +240,13 @@ class ProductionAgent:
             failure_threshold=3,
             recovery_timeout=60.0,
         )
+        self._cost_tracker_instance = LLMCostTracker(
+            max_estimated_cost_per_request_usd=(
+                settings.max_estimated_llm_cost_per_request_usd
+            ),
+            max_total_cost_usd=settings.max_total_llm_cost_usd,
+        )
+        self._cost_callback = TokenUsageCallback(self._cost_tracker_instance)
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -296,6 +312,7 @@ class ProductionAgent:
             max_retries=0,
             api_key=api_key,
             base_url=settings.llm_base_url,
+            callbacks=[self._cost_callback],
         )
         self.query_rewriter = (
             ChatPromptTemplate.from_messages(
@@ -331,6 +348,7 @@ class ProductionAgent:
             max_retries=0,
             api_key=api_key,
             base_url=settings.llm_base_url,
+            callbacks=[self._cost_callback],
         )
         self.fallback_chain = (
             prompt
@@ -367,22 +385,103 @@ class ProductionAgent:
             return cb
         return _NoopCircuit()  # type: ignore[return-value]
 
+    @property
+    def _cost_tracker(self) -> LLMCostTracker:
+        """Lazy cost tracker; falls back to a default for test doubles."""
+        tracker = getattr(self, "_cost_tracker_instance", None)
+        if tracker is not None:
+            return tracker
+        return LLMCostTracker()
+
+    def _guarded_llm_call(
+        self,
+        invoke: Callable[[], Any],
+        *,
+        model_name: str,
+        estimated_input_tokens: int,
+    ) -> Any:
+        """Invoke an LLM call while enforcing the runaway-cost guardrails.
+
+        ``invoke`` is a zero-argument callable wrapping the circuit-managed LLM
+        call; guardrails run before it and raise ``LLMCostLimitExceeded`` when the
+        estimated spend would breach a configured limit.
+        """
+        tracker = self._cost_tracker
+        estimated_cost = tracker.estimate_cost(model_name, estimated_input_tokens)
+        if not tracker.can_spend(estimated_cost):
+            self.logger.warning(
+                "LLM call blocked by the cost guardrail",
+                extra={
+                    "extra_data": {
+                        "model": model_name,
+                        "estimated_cost_usd": estimated_cost,
+                    }
+                },
+            )
+            raise LLMCostLimitExceeded(
+                f"Estimated LLM cost of {estimated_cost:.6f} USD for "
+                f"{model_name} is blocked by the cost guardrail."
+            )
+        try:
+            return invoke()
+        finally:
+            tracker.release_reservation(estimated_cost)
+
+    def _cost_limited_response(self) -> str:
+        """Safe answer text returned when the cost guardrail blocks calls."""
+        return (
+            "I could not generate an answer because the configured "
+            "language model cost limit was reached. Please try again later."
+        )
+
+    def _cost_limited_answer_payload(
+        self,
+        *,
+        model_used: str,
+    ) -> dict[str, Any]:
+        """Return the graceful answer payload used when the guardrail trips."""
+        return self._answer_payload(
+            response=self._cost_limited_response(),
+            model_used=model_used,
+            sources=[],
+            grounding_status="unverified",
+        )
+
+    def get_llm_usage_summary(self) -> dict[str, int | float]:
+        """Return LLM token and cost totals for the metrics endpoint."""
+        return self._cost_tracker.get_usage_summary()
+
     def _answer_from_general_knowledge(self, message: str) -> tuple[str, str]:
         """Answer without document context and clearly label the answer."""
         try:
-            response = self._llm_circuit.call(
-                self.general_chain.invoke,
-                {"question": message},
+            response = self._guarded_llm_call(
+                partial(
+                    self._llm_circuit.call,
+                    self.general_chain.invoke,
+                    {"question": message},
+                ),
+                model_name=self.primary_model_name,
+                estimated_input_tokens=estimate_tokens(message),
             )
             model_used = "primary"
+        except LLMCostLimitExceeded:
+            return (self._cost_limited_response(), "primary")
         except CircuitBreakerOpen:
             self.logger.warning(
                 "Primary model circuit is open; using general-knowledge fallback",
             )
-            response = self.general_fallback_chain.invoke(
-                {"question": message}
-            )
-            model_used = "fallback"
+            try:
+                response = self._guarded_llm_call(
+                    partial(
+                        self.general_fallback_chain.invoke,
+                        {"question": message},
+                    ),
+                    model_name=self.fallback_model_name,
+                    estimated_input_tokens=estimate_tokens(message),
+                )
+                model_used = "fallback"
+            except LLMCostLimitExceeded:
+                return (self._cost_limited_response(), "fallback")
         except Exception as primary_error:
             self.logger.warning(
                 "Primary general-knowledge model failed; trying fallback",
@@ -392,10 +491,18 @@ class ProductionAgent:
                     }
                 },
             )
-            response = self.general_fallback_chain.invoke(
-                {"question": message}
-            )
-            model_used = "fallback"
+            try:
+                response = self._guarded_llm_call(
+                    partial(
+                        self.general_fallback_chain.invoke,
+                        {"question": message},
+                    ),
+                    model_name=self.fallback_model_name,
+                    estimated_input_tokens=estimate_tokens(message),
+                )
+                model_used = "fallback"
+            except LLMCostLimitExceeded:
+                return (self._cost_limited_response(), "fallback")
 
         return (
             "I couldn't find relevant information in your documents. "
@@ -451,19 +558,34 @@ class ProductionAgent:
             )
 
         try:
-            response = self._llm_circuit.call(
-                self.primary_chain.invoke,
-                {"context": context, "question": message},
+            response = self._guarded_llm_call(
+                partial(
+                    self._llm_circuit.call,
+                    self.primary_chain.invoke,
+                    {"context": context, "question": message},
+                ),
+                model_name=self.primary_model_name,
+                estimated_input_tokens=estimate_tokens(context, message),
             )
             model_used = "primary"
+        except LLMCostLimitExceeded:
+            return self._cost_limited_answer_payload(model_used="primary")
         except CircuitBreakerOpen:
             self.logger.warning(
                 "Primary model circuit is open; trying fallback",
             )
-            response = self.fallback_chain.invoke(
-                {"context": context, "question": message}
-            )
-            model_used = "fallback"
+            try:
+                response = self._guarded_llm_call(
+                    partial(
+                        self.fallback_chain.invoke,
+                        {"context": context, "question": message},
+                    ),
+                    model_name=self.fallback_model_name,
+                    estimated_input_tokens=estimate_tokens(context, message),
+                )
+                model_used = "fallback"
+            except LLMCostLimitExceeded:
+                return self._cost_limited_answer_payload(model_used="fallback")
         except Exception as primary_error:
             self.logger.warning(
                 "Primary chat model failed; trying fallback",
@@ -473,10 +595,18 @@ class ProductionAgent:
                     }
                 },
             )
-            response = self.fallback_chain.invoke(
-                {"context": context, "question": message}
-            )
-            model_used = "fallback"
+            try:
+                response = self._guarded_llm_call(
+                    partial(
+                        self.fallback_chain.invoke,
+                        {"context": context, "question": message},
+                    ),
+                    model_name=self.fallback_model_name,
+                    estimated_input_tokens=estimate_tokens(context, message),
+                )
+                model_used = "fallback"
+            except LLMCostLimitExceeded:
+                return self._cost_limited_answer_payload(model_used="fallback")
 
         if self._is_source_abstention(response):
             response, model_used = self._answer_from_general_knowledge(message)
@@ -542,12 +672,17 @@ class ProductionAgent:
         if not self.query_expansion_enabled:
             return queries
         try:
-            rewrites = self._llm_circuit.call(
-                self.query_rewriter.invoke,
-                {
-                    "question": message,
-                    "query_count": self.query_expansion_count,
-                },
+            rewrites = self._guarded_llm_call(
+                partial(
+                    self._llm_circuit.call,
+                    self.query_rewriter.invoke,
+                    {
+                        "question": message,
+                        "query_count": self.query_expansion_count,
+                    },
+                ),
+                model_name=self.primary_model_name,
+                estimated_input_tokens=estimate_tokens(message),
             )
             queries.extend(
                 self._parse_rewritten_queries(
@@ -618,12 +753,21 @@ class ProductionAgent:
     ) -> GroundingStatus:
         """Compare answer claims with evidence; fail closed to unknown."""
         try:
-            verdict = self.grounding_chain.invoke(
-                {
-                    "context": context,
-                    "question": question,
-                    "response": response,
-                }
+            verdict = self._guarded_llm_call(
+                partial(
+                    self.grounding_chain.invoke,
+                    {
+                        "context": context,
+                        "question": question,
+                        "response": response,
+                    },
+                ),
+                model_name=self.primary_model_name,
+                estimated_input_tokens=estimate_tokens(
+                    context,
+                    question,
+                    response,
+                ),
             )
         except Exception as error:
             self.logger.warning(

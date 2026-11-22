@@ -99,6 +99,11 @@ class MetricResponse(BaseModel):
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    llm_calls: int = 0
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
+    llm_total_tokens: int = 0
+    llm_estimated_cost_usd: float = 0.0
 
 
 class ErrorResponse(BaseModel):

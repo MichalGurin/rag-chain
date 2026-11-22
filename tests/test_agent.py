@@ -1,10 +1,12 @@
 import hashlib
 from unittest.mock import MagicMock, Mock
 
+import pytest
 from langchain_core.documents import Document
 
-from app.agent import ProductionAgent
+from app.agent import CircuitBreakerOpen, ProductionAgent
 from app.database.engine import normalize_database_url
+from app.llm_cost import LLMCostTracker
 from app.models import DocumentInput
 from app.monitoring import get_logger
 
@@ -18,6 +20,8 @@ def make_agent():
     agent.max_context_chars = 12000
     agent.query_expansion_enabled = False
     agent.query_expansion_count = 2
+    agent.primary_model_name = "gpt-4o-mini"
+    agent.fallback_model_name = "gpt-4o-mini"
     agent.query_rewriter = Mock()
     agent.primary_chain = Mock()
     agent.fallback_chain = Mock()
@@ -74,6 +78,129 @@ def test_agent_uses_fallback_model_after_primary_failure():
     assert result["response"] == "I do not know. [1]"
     assert result["sources"] == ["source-a"]
     agent.fallback_chain.invoke.assert_called_once()
+
+
+def test_agent_blocks_answer_when_estimated_cost_exceeds_limit():
+    agent = make_agent()
+    agent._cost_tracker_instance = LLMCostTracker(
+        max_estimated_cost_per_request_usd=0.00001,
+    )
+    agent.vector_store.max_marginal_relevance_search.return_value = [
+        Document(page_content="Known fact.", metadata={"source": "source-a"})
+    ]
+    agent.primary_chain.invoke.return_value = "Supported answer [1]."
+
+    result = agent.invoke("How many days?")
+
+    assert result["response"].startswith("I could not generate an answer")
+    assert result["sources"] == []
+    assert result["grounding_status"] == "unverified"
+    agent.primary_chain.invoke.assert_not_called()
+    agent.fallback_chain.invoke.assert_not_called()
+
+
+def test_agent_returns_safe_answer_when_fallback_cost_limit_is_exceeded():
+    agent = make_agent()
+    agent._cost_tracker_instance = LLMCostTracker(
+        max_estimated_cost_per_request_usd=0.00001,
+    )
+    agent.primary_chain.invoke.side_effect = RuntimeError("primary unavailable")
+    agent.fallback_chain.invoke.return_value = "Fallback answer [1]."
+
+    agent.vector_store.max_marginal_relevance_search.return_value = [
+        Document(page_content="Known fact.", metadata={"source": "source-a"})
+    ]
+
+    result = agent.invoke("What is not in the documents?")
+
+    assert result["response"].startswith("I could not generate an answer")
+    assert result["sources"] == []
+    agent.fallback_chain.invoke.assert_not_called()
+
+
+def test_agent_returns_safe_answer_when_circuit_open_fallback_is_blocked():
+    agent = make_agent()
+    agent._cost_tracker_instance = LLMCostTracker(
+        max_estimated_cost_per_request_usd=0.00001,
+    )
+    agent.primary_chain.invoke.side_effect = CircuitBreakerOpen("open")
+    agent.fallback_chain.invoke.return_value = "Fallback answer [1]."
+
+    agent.vector_store.max_marginal_relevance_search.return_value = [
+        Document(page_content="Known fact.", metadata={"source": "source-a"})
+    ]
+
+    result = agent.invoke("What is not in the documents?")
+
+    assert result["response"].startswith("I could not generate an answer")
+    agent.fallback_chain.invoke.assert_not_called()
+
+
+def test_guarded_call_releases_reservation_when_invoke_fails():
+    agent = make_agent()
+    agent._cost_tracker_instance = LLMCostTracker(
+        max_total_cost_usd=0.001,
+    )
+
+    def fail():
+        raise RuntimeError("model unavailable")
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        agent._guarded_llm_call(
+            fail,
+            model_name="gpt-4o-mini",
+            estimated_input_tokens=100,
+        )
+
+    estimate = agent._cost_tracker.estimate_cost("gpt-4o-mini", 100)
+    assert agent._cost_tracker.can_spend(estimate)
+
+
+def test_agent_returns_safe_answer_when_general_knowledge_call_is_blocked():
+    agent = make_agent()
+    agent._cost_tracker_instance = LLMCostTracker(
+        max_estimated_cost_per_request_usd=0.00001,
+    )
+    agent.vector_store.max_marginal_relevance_search.return_value = []
+
+    result = agent.invoke("What is the capital of Canada?")
+
+    assert result["response"].startswith("I could not generate an answer")
+    assert result["sources"] == []
+    assert result["grounding_status"] == "unverified"
+    agent.general_chain.invoke.assert_not_called()
+
+
+def test_agent_skips_query_expansion_when_cost_limit_is_exceeded():
+    agent = make_agent()
+    agent.query_expansion_enabled = True
+    agent._cost_tracker_instance = LLMCostTracker(
+        max_estimated_cost_per_request_usd=0.00001,
+    )
+    agent.query_rewriter.invoke.return_value = "How to terminate a plan?"
+    agent.vector_store.max_marginal_relevance_search.return_value = [
+        Document(page_content="Cancellation details.", metadata={"source": "faq"})
+    ]
+    agent.primary_chain.invoke.return_value = "Use the cancellation process [1]."
+
+    result = agent.invoke("How do I cancel?")
+
+    assert result["response"].startswith("I could not generate an answer")
+    agent.query_rewriter.invoke.assert_not_called()
+    agent.vector_store.max_marginal_relevance_search.assert_called_once()
+
+
+def test_agent_skips_grounding_llm_call_when_cost_limit_is_exceeded():
+    agent = make_agent()
+    agent._cost_tracker_instance = LLMCostTracker(
+        max_estimated_cost_per_request_usd=0.00001,
+    )
+    agent.grounding_chain.invoke.return_value = "SUPPORTED"
+
+    assert agent._check_grounding("Question?", "An answer [1].", "Evidence.") == (
+        "unverified"
+    )
+    agent.grounding_chain.invoke.assert_not_called()
 
 
 def test_query_expansion_adds_distinct_search_terms():

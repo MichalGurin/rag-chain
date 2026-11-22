@@ -35,6 +35,10 @@ services:
         value: "300"
       - key: CACHE_MAX_ENTRIES
         value: "1000"
+      - key: MAX_ESTIMATED_LLM_COST_PER_REQUEST_USD
+        value: "0.05"
+      - key: MAX_TOTAL_LLM_COST_USD
+        value: ""
       - key: PRIMARY_MODEL
         value: llama3.2:1b
       - key: FALLBACK_MODEL
