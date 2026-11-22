@@ -1,5 +1,6 @@
 """End-to-end tests for API upload, PostgreSQL jobs, Redis, and Celery workers."""
 
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -199,6 +200,21 @@ def test_upload_is_processed_by_a_real_celery_worker(
         worker.wait(timeout=10)
         worker_log.close()
         engine.dispose()
+
+
+@pytest.mark.e2e
+def test_migrations_do_not_disable_the_api_logger(monkeypatch):
+    """Migrations run in the test process, so they must leave logging usable."""
+    database_url = os.getenv("E2E_DATABASE_URL")
+    if not database_url:
+        pytest.skip("Set E2E_DATABASE_URL to run service tests.")
+
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    command.upgrade(_migration_config(database_url), "head")
+
+    assert main.logger.isEnabledFor(logging.INFO), (
+        "Alembic silenced the API logger for the rest of the test session."
+    )
 
 
 class _ApiAgent:

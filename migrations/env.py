@@ -10,7 +10,10 @@ from app.database.schema import metadata
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Alembic's default disables every logger that alembic.ini does not name,
+    # which silences the application logger for the rest of the process when
+    # migrations run in the same process as the API or the test suite.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 database_url = os.environ.get("DATABASE_URL")
 if database_url is None:
