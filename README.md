@@ -86,22 +86,50 @@ The bundled `rag:rag` database credentials are for local development only.
 
 ## LangSmith tracing
 
-LangSmith tracing is opt-in. To enable traces for the API and document
-ingestion worker, set `LANGSMITH_TRACING=true` and provide `LANGSMITH_API_KEY`
-as a secret in each process environment. The API key is required when tracing
-is enabled; missing credentials fail configuration validation at startup.
-`LANGSMITH_PROJECT` optionally selects a project (otherwise the project is
-`prod-rag-<APP_ENV>`), and `LANGSMITH_ENDPOINT` can select a regional LangSmith
-endpoint. `LANGSMITH_TRACING_SAMPLING_RATE` accepts a value from `0` to `1`.
+LangSmith tracing is opt-in and configured once per process, so the API, the
+ingestion worker, and the outbox dispatcher report to the same project with the
+same privacy policy. Set `LANGSMITH_TRACING=true` and provide
+`LANGSMITH_API_KEY` as a secret in each process environment. The API key is
+required when tracing is enabled; missing credentials fail configuration
+validation at startup. `LANGSMITH_PROJECT` optionally selects a project, and the
+default `prod-rag-<APP_ENV>` keeps development, staging, and production traces
+apart. `LANGSMITH_TRACING_SAMPLING_RATE` accepts a value from `0` to `1` to trace
+a stable share of requests on busy deployments.
 
-Trace inputs and outputs are hidden by default to avoid sending questions,
-answers, or retrieved document text to LangSmith. Set
-`LANGSMITH_HIDE_INPUTS=false` and/or `LANGSMITH_HIDE_OUTPUTS=false` only after
-reviewing your data-handling requirements. API traces include request,
-environment, tenant, and optional thread correlation metadata; indexing jobs
-are traced as separate runs. Cached chat responses do not invoke the RAG chain
-and therefore do not create a LangSmith trace. Ordinary application logs never
-include the LangSmith API key.
+`LANGSMITH_ENDPOINT` selects the LangSmith API host, and defaults to the GCP US
+cloud. LangSmith API keys are region specific, so an organization in another
+region must set both its endpoint (for example
+`https://eu.api.smith.langchain.com`) and a key created in that region.
+
+A traced chat request appears in LangSmith as one `rag.invoke` tree with a named
+span for every step: `rag.query_expansion`, `rag.retrieve`, `rag.rerank`, and
+`rag.grounding`. The answer adds `grounded` and `cited` feedback scores to that
+trace, so grounding and citation rates are chartable instead of read one answer
+at a time. `X-LangSmith-Run-Id` is returned on `/chat` when tracing is on, and
+`request_id`, `tenant_id`, `indexing_version`, corpus generation, and the
+optional `thread_id` are recorded as trace metadata, which is how a user report
+from the frontend becomes the exact trace to open.
+
+An upload traced in the API produces a `document.dispatch` span, and each Celery
+`document.index` job is nested under it, so a slow or failed indexing job is
+readable as part of the request that queued it rather than as a separate orphan
+run. `X-LangSmith-Run-Id` is returned on `/documents/upload` when tracing is on,
+which is the span id to open when a queued document never finishes.
+
+Chunking and embedding runs are traced as `document.ingest` with a document
+summary instead of document text, and traced inputs never include database
+engines, agent objects, or Celery task objects.
+
+Trace payloads follow the environment by default: prompts, answers, and
+retrieved document text are visible in development and hidden in production. Set
+`LANGSMITH_HIDE_INPUTS` or `LANGSMITH_HIDE_OUTPUTS` explicitly (`true` or
+`false`) to override that default in either direction. Whatever is sent is
+scrubbed on the way out: emails and phone numbers become `[REDACTED EMAIL]` and
+`[REDACTED PHONE]` in inputs, outputs, and errors. Cached chat responses do not
+invoke the RAG chain and therefore do not create a LangSmith trace. Traces are
+buffered and flushed before the API or a worker process exits, and a trace
+export failure is logged as a warning without failing the request or job that
+produced it. Ordinary application logs never include the LangSmith API key.
 
 To run the tests:
 
@@ -265,6 +293,21 @@ checked-in examples are a schema/template: replace the source labels and
 queries with gold judgments for the corpus being evaluated. It does not call
 an LLM or require an external evaluation service.
 
+To compare retrieval changes over time, run the same evaluation as a LangSmith
+experiment with tracing enabled in the environment:
+
+```powershell
+uv run python scripts\evaluate_retrieval.py --dataset evaluation\gold_queries.jsonl --k 5 --langsmith
+```
+
+This syncs the gold queries into a `<project>-retrieval-gold` dataset, runs each
+query through the live hybrid retrieval as its own traced run, scores every run
+with `hit@K` and `mrr@K`, and prints the aggregate metrics with an
+`experiment_url` linking to the LangSmith comparison view. Each experiment
+records the environment, `indexing_version`, and `top_k` as metadata, so a
+chunking, embedding, or reranking change is comparable against the run before it
+instead of being judged by a single number in a terminal.
+
 ## Chat API
 
 In development, chat API-key enforcement is optional. Production mode
@@ -316,12 +359,17 @@ outbox dispatcher, and Redis) and a production Docker image in
    Set `INGEST_API_KEY` to enable document uploads. Use the provider's
    pgvector-compatible PostgreSQL URL, for example
    `postgresql+psycopg://...`.
-4. Configure database access so only the application can connect. Run the
+4. To trace production traffic, set `LANGSMITH_TRACING=true` and add
+   `LANGSMITH_API_KEY` as a secret on the API, the worker, and the dispatcher.
+   The blueprint ships those services with tracing off and `LANGSMITH_PROJECT`
+   set to `prod-rag-production`, so tracing is a per-deployment switch rather
+   than a code change, and every service in one deployment writes to one project.
+5. Configure database access so only the application can connect. Run the
    service behind a trusted proxy/load balancer and use HTTPS. Set
    `FORWARDED_ALLOW_IPS` to the proxy's trusted IP address(es) or CIDR ranges;
    the container defaults to trusting only `127.0.0.1`. Do not use `*` unless
    network controls ensure that only your trusted proxy can reach the app.
-5. Review the provider plan, database sizing, backup/recovery, log retention,
+6. Review the provider plan, database sizing, backup/recovery, log retention,
    rate limits, and cost controls for the expected workload.
 
 `/health/live` is a process liveness check; `/health` is a readiness check that
@@ -357,6 +405,10 @@ metrics, not a replacement for a production metrics backend.
   use the client address; configure `FORWARDED_ALLOW_IPS`
   with only the deployment's trusted proxy ranges so requests are not all
   attributed to the proxy or spoofed by untrusted forwarded headers.
-- LangSmith tracing is not configured by the application. If you enable it
-  through LangChain's standard environment variables, review its data
-  retention and privacy settings before sending prompts or retrieved content.
+- LangSmith tracing is opt-in and off in the shipped configuration. When you
+  enable it, the application applies the same client policy to the API, the
+  worker, and the dispatcher: PII scrubbing, the payload visibility default for
+  the environment, and the sampling rate. Review LangSmith retention and
+  residency before tracing a corpus that may hold personal data, and set
+  `LANGSMITH_HIDE_INPUTS` and `LANGSMITH_HIDE_OUTPUTS` explicitly if your
+  policy is stricter than the default.

@@ -1,13 +1,21 @@
 """Celery tasks for document indexing and outbox delivery."""
 
+from contextlib import nullcontext
+from typing import Any
+
 from celery import Celery
 from celery.app.task import Task
-from langsmith import traceable
+from celery.signals import worker_process_init, worker_process_shutdown
+from langsmith import traceable, tracing_context
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent import ProductionAgent
-from app.config import get_settings
+from app.config import (
+    configure_langsmith_tracing,
+    flush_langsmith_traces,
+    get_settings,
+)
 from app.database import DocumentRepository, create_database_engine
 from app.ingestion.parser import parse_document
 from app.models import ParsedDocument
@@ -46,6 +54,27 @@ celery_app.conf.update(
 )
 
 
+@worker_process_init.connect
+def configure_worker_tracing(**_kwargs: Any) -> None:
+    """Give each worker process the same LangSmith client and policy as the API."""
+    configure_langsmith_tracing(settings)
+
+
+@worker_process_shutdown.connect
+def flush_worker_traces(**_kwargs: Any) -> None:
+    """Send buffered traces before a worker process exits."""
+    flush_langsmith_traces()
+
+
+def _trace_task_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Keep Celery task objects out of traced run inputs."""
+    return {
+        name: value
+        for name, value in inputs.items()
+        if not isinstance(value, Task)
+    }
+
+
 @celery_app.task(
     bind=True,
     name="app.process_document",
@@ -54,6 +83,21 @@ celery_app.conf.update(
     retry_backoff=True,
     retry_backoff_max=60,
 )
+def process_document(
+    self,
+    document_id: str,
+    langsmith_parent_trace: str | None = None,
+) -> dict[str, int | str]:
+    """Index a document under the trace that queued it, when one was supplied."""
+    parent_context = (
+        tracing_context(parent=langsmith_parent_trace)
+        if langsmith_parent_trace
+        else nullcontext()
+    )
+    with parent_context:
+        return _index_document(self, document_id)
+
+
 @traceable(
     name="document.index",
     run_type="chain",
@@ -61,9 +105,11 @@ celery_app.conf.update(
     metadata={
         "environment": settings.app_env,
         "tenant_id": settings.effective_tenant_id,
+        "indexing_version": settings.indexing_version,
     },
+    process_inputs=_trace_task_inputs,
 )
-def process_document(self, document_id: str) -> dict[str, int | str]:
+def _index_document(task: Task, document_id: str) -> dict[str, int | str]:
     """Index the current revision; ignore stale IDs and retry transient failures."""
     engine = create_database_engine(settings)
     tenant_id = settings.effective_tenant_id
@@ -169,7 +215,7 @@ def process_document(self, document_id: str) -> dict[str, int | str]:
             }
         except Exception as exc:
             _record_processing_failure(
-                self,
+                task,
                 repository,
                 document_id,
                 source,

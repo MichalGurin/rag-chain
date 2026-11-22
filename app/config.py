@@ -1,10 +1,35 @@
 import hashlib
 import os
 from functools import lru_cache
+from uuid import uuid4
 from urllib.parse import urlparse
 
+from langsmith import Client
+from langsmith import configure as langsmith_configure
+from langsmith.anonymizer import create_anonymizer
+from langsmith.run_helpers import get_current_run_tree
+from langsmith.run_trees import get_cached_client
+from langsmith.utils import tracing_is_enabled
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.monitoring import get_logger
+from app.security import PIIDetector
+
+logger = get_logger("prod-rag.config")
+
+# LangSmith applies this to every traced input, output, metadata value, and error
+# message, so PII is masked before it leaves the process even when payloads are visible.
+PII_ANONYMIZER = create_anonymizer(PIIDetector().mask)
+
+# The SDK default. Regional organizations must set LANGSMITH_ENDPOINT, because API
+# keys carry no region hint and are rejected by every other region's API.
+DEFAULT_LANGSMITH_ENDPOINT = "https://api.smith.langchain.com"
+
+
+def _log_tracing_error(error: BaseException) -> None:
+    """Report trace export failures without breaking the traced request."""
+    logger.warning("LangSmith trace export failed", exc_info=error)
 
 
 class Settings(BaseSettings):
@@ -54,8 +79,8 @@ class Settings(BaseSettings):
     )
     langsmith_endpoint: str | None = None
     langsmith_tracing_sampling_rate: float = Field(default=1.0, ge=0, le=1)
-    langsmith_hide_inputs: bool = True
-    langsmith_hide_outputs: bool = True
+    langsmith_hide_inputs: bool | None = None
+    langsmith_hide_outputs: bool | None = None
     rate_limit: str = "20/minute"
     ingest_rate_limit: str = "5/minute"
     max_ingest_chars: int = Field(default=250_000, ge=1, le=5_000_000)
@@ -204,6 +229,25 @@ class Settings(BaseSettings):
         """Separate traces by environment unless a project is explicitly set."""
         return self.langsmith_project or f"prod-rag-{self.app_env.lower()}"
 
+    @property
+    def effective_langsmith_endpoint(self) -> str:
+        """Report the API host traces are posted to, which keys are region bound to."""
+        return self.langsmith_endpoint or DEFAULT_LANGSMITH_ENDPOINT
+
+    @property
+    def effective_langsmith_hide_inputs(self) -> bool:
+        """Hide trace inputs in production unless explicitly configured."""
+        if self.langsmith_hide_inputs is None:
+            return self.is_production
+        return self.langsmith_hide_inputs
+
+    @property
+    def effective_langsmith_hide_outputs(self) -> bool:
+        """Hide trace outputs in production unless explicitly configured."""
+        if self.langsmith_hide_outputs is None:
+            return self.is_production
+        return self.langsmith_hide_outputs
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -213,28 +257,117 @@ def get_settings() -> Settings:
     return settings
 
 
+def build_langsmith_client(settings: Settings) -> Client:
+    """Build the single LangSmith client this process reports traces through."""
+    return Client(
+        api_url=settings.effective_langsmith_endpoint,
+        api_key=settings.langsmith_api_key.get_secret_value()
+        if settings.langsmith_api_key is not None
+        else None,
+        anonymizer=PII_ANONYMIZER,
+        hide_inputs=settings.effective_langsmith_hide_inputs,
+        hide_outputs=settings.effective_langsmith_hide_outputs,
+        tracing_sampling_rate=settings.langsmith_tracing_sampling_rate,
+        tracing_error_callback=_log_tracing_error,
+    )
+
+
 def configure_langsmith_tracing(settings: Settings) -> None:
-    """Set LangSmith's supported environment-based tracing configuration."""
+    """Apply this service's tracing policy to the LangSmith SDK.
+
+    The environment variables keep every SDK code path, including clients built
+    by dependencies and child processes, on the same project and payload policy.
+    The configured client additionally pins PII masking and trace-export errors
+    for this process.
+    """
     os.environ["LANGSMITH_TRACING"] = str(settings.langsmith_tracing).lower()
     os.environ["LANGSMITH_PROJECT"] = settings.effective_langsmith_project
     os.environ["LANGSMITH_TRACING_SAMPLING_RATE"] = str(
         settings.langsmith_tracing_sampling_rate
     )
     os.environ["LANGSMITH_HIDE_INPUTS"] = str(
-        settings.langsmith_hide_inputs
+        settings.effective_langsmith_hide_inputs
     ).lower()
     os.environ["LANGSMITH_HIDE_OUTPUTS"] = str(
-        settings.langsmith_hide_outputs
+        settings.effective_langsmith_hide_outputs
     ).lower()
-
-    if settings.langsmith_api_key is not None:
+    if settings.langsmith_api_key is None:
+        os.environ.pop("LANGSMITH_API_KEY", None)
+    else:
         os.environ["LANGSMITH_API_KEY"] = (
             settings.langsmith_api_key.get_secret_value()
         )
-    else:
-        os.environ.pop("LANGSMITH_API_KEY", None)
+    # Always export the host: dependencies that build their own LangSmith client
+    # must post to the same regional API as the configured client.
+    os.environ["LANGSMITH_ENDPOINT"] = settings.effective_langsmith_endpoint
 
-    if settings.langsmith_endpoint:
-        os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint
-    else:
-        os.environ.pop("LANGSMITH_ENDPOINT", None)
+    if not settings.langsmith_tracing:
+        langsmith_configure(enabled=False)
+        return
+
+    langsmith_configure(
+        client=build_langsmith_client(settings),
+        enabled=True,
+        project_name=settings.effective_langsmith_project,
+    )
+
+
+def flush_langsmith_traces(timeout: float = 5.0) -> bool:
+    """Export buffered traces before a process exits so shutdown is not lossy."""
+    if not tracing_is_enabled():
+        return False
+    try:
+        get_cached_client().flush(timeout=timeout)
+    except Exception as error:
+        _log_tracing_error(error)
+        return False
+    return True
+
+
+def new_langsmith_run_id() -> str | None:
+    """Return the trace identifier this request's root run will use, if traced.
+
+    Knowing the identifier before the RAG chain runs lets the API return it to
+    the caller, who can then open that exact trace in LangSmith.
+    """
+    if not tracing_is_enabled():
+        return None
+    return str(uuid4())
+
+
+def langsmith_parent_trace() -> str | None:
+    """Return the current run's dotted order for background jobs to nest under."""
+    if not tracing_is_enabled():
+        return None
+    run_tree = get_current_run_tree()
+    if run_tree is None or not run_tree.dotted_order:
+        return None
+    return run_tree.dotted_order
+
+
+def record_langsmith_feedback(
+    *,
+    trace_id: str,
+    key: str,
+    value: str | int,
+    score: int,
+) -> bool:
+    """Attach automatic feedback to a trace for LangSmith analytics.
+
+    The trace identifier is supplied so feedback is batched in the background;
+    answering a request never waits on the LangSmith API.
+    """
+    if not tracing_is_enabled():
+        return False
+    try:
+        get_cached_client().create_feedback(
+            key=key,
+            trace_id=trace_id,
+            value=value,
+            score=score,
+            feedback_source_type="model",
+        )
+        return True
+    except Exception as error:
+        _log_tracing_error(error)
+        return False

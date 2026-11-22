@@ -19,7 +19,11 @@ from app.agent import ProductionAgent
 from app.api.documents import router as documents_router
 from app.api.limits import limiter
 from app.cache import CachedResponse, ResponseCache
-from app.config import get_settings
+from app.config import (
+    flush_langsmith_traces,
+    get_settings,
+    new_langsmith_run_id,
+)
 from app.database import DocumentRepository, create_database_engine
 from app.models import (
     ChatRequest,
@@ -83,11 +87,16 @@ async def lifespan(application: FastAPI):
                     "vector_collection": settings.vector_collection_name,
                     "langsmith_tracing": settings.langsmith_tracing,
                     "langsmith_project": settings.effective_langsmith_project,
+                    "langsmith_endpoint": settings.effective_langsmith_endpoint,
                     "langsmith_sampling_rate": (
                         settings.langsmith_tracing_sampling_rate
                     ),
-                    "langsmith_hide_inputs": settings.langsmith_hide_inputs,
-                    "langsmith_hide_outputs": settings.langsmith_hide_outputs,
+                    "langsmith_hide_inputs": (
+                        settings.effective_langsmith_hide_inputs
+                    ),
+                    "langsmith_hide_outputs": (
+                        settings.effective_langsmith_hide_outputs
+                    ),
                 }
             },
         )
@@ -117,6 +126,7 @@ async def lifespan(application: FastAPI):
         logger.info("RAG API is ready")
         yield
     finally:
+        flush_langsmith_traces()
         logger.info(
             "Shutting down RAG API",
             extra={"extra_data": application.state.metrics.get_summary()},
@@ -196,9 +206,10 @@ async def http_exception_handler(
 
 
 @app.post("/chat", response_model=ChatResponse)
-@limiter.limit(get_settings().rate_limit)
+@limiter.limit(lambda: get_settings().rate_limit)
 def chat(
     request: Request,
+    response: Response,
     body: ChatRequest,
     x_chat_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> ChatResponse:
@@ -219,6 +230,7 @@ def chat(
         raise HTTPException(status_code=401, detail="Invalid API key.")
     timer = RequestTimer()
     cache_hit = False
+    trace_run_id: str | None = None
 
     try:
         with timer:
@@ -260,14 +272,23 @@ def chat(
                     "request_id": request.state.request_id,
                     "environment": settings.app_env,
                     "tenant_id": settings.effective_tenant_id,
+                    "indexing_version": settings.indexing_version,
                 }
+                if corpus_version:
+                    trace_metadata["corpus_generation"] = corpus_version
                 if body.thread_id:
                     trace_metadata["thread_id"] = body.thread_id
-                with tracing_context(
-                    tags=["api", "chat"],
-                    metadata=trace_metadata,
-                ):
-                    result = agent.invoke(cleaned_message)
+                trace_run_id = new_langsmith_run_id()
+                langsmith_extra = {
+                    "tags": ["api", "chat"],
+                    "metadata": trace_metadata,
+                }
+                if trace_run_id is not None:
+                    langsmith_extra["run_id"] = trace_run_id
+                result = agent.invoke(
+                    cleaned_message,
+                    langsmith_extra=langsmith_extra,
+                )
                 response_text, output_warnings = security.check_output(
                     result["response"]
                 )
@@ -327,16 +348,18 @@ def chat(
                 }
             },
         )
+    completed = {
+        "request_id": request.state.request_id,
+        "model_used": model_used,
+        "cached": cache_hit,
+        "latency_ms": round(timer.elapsed_ms, 2),
+    }
+    if trace_run_id:
+        completed["langsmith_run_id"] = trace_run_id
+        response.headers["X-LangSmith-Run-Id"] = trace_run_id
     logger.info(
         "RAG request completed",
-        extra={
-            "extra_data": {
-                "request_id": request.state.request_id,
-                "model_used": model_used,
-                "cached": cache_hit,
-                "latency_ms": round(timer.elapsed_ms, 2),
-            }
-        },
+        extra={"extra_data": completed},
     )
     return ChatResponse(
         response=response_text,
@@ -350,7 +373,7 @@ def chat(
 
 
 @app.post("/documents", response_model=IngestResponse)
-@limiter.limit(get_settings().ingest_rate_limit)
+@limiter.limit(lambda: get_settings().ingest_rate_limit)
 def ingest_documents(
     request: Request,
     body: IngestRequest,
@@ -383,7 +406,16 @@ def ingest_documents(
         )
 
     try:
-        chunks_indexed = request.app.state.agent.ingest_documents(body.documents)
+        with tracing_context(
+            tags=["api", "ingestion"],
+            metadata={
+                "request_id": request.state.request_id,
+                "environment": settings.app_env,
+                "tenant_id": settings.effective_tenant_id,
+                "indexing_version": settings.indexing_version,
+            },
+        ):
+            chunks_indexed = request.app.state.agent.ingest_documents(body.documents)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:

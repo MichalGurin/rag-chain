@@ -3,14 +3,21 @@
 import hashlib
 import hmac
 import zipfile
+from functools import partial
 from pathlib import Path, PurePath
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Header, HTTPException, Request, Response, UploadFile
+from langsmith import traceable
 from starlette.concurrency import run_in_threadpool
 
 from app.api.limits import limiter
-from app.config import Settings, get_settings
+from app.config import (
+    Settings,
+    get_settings,
+    langsmith_parent_trace,
+    new_langsmith_run_id,
+)
 from app.database import DocumentRepository
 from app.ingestion.tasks import process_document
 from app.ingestion.storage import delete_upload, upload_path
@@ -113,12 +120,33 @@ def _authenticate_ingestion(request: Request, supplied_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid ingestion API key.")
 
 
+@traceable(
+    name="document.dispatch",
+    run_type="chain",
+    tags=["api", "ingestion"],
+    process_inputs=lambda inputs: {"document_id": inputs.get("document_id")},
+)
+def _dispatch_queued_documents(
+    repository: DocumentRepository,
+    document_id: str,
+) -> int:
+    """Publish queued jobs under this request's trace so indexing stays linked."""
+    parent_trace = langsmith_parent_trace()
+    publish = process_document.apply_async
+    if parent_trace is not None:
+        publish = partial(
+            publish,
+            kwargs={"langsmith_parent_trace": parent_trace},
+        )
+    return repository.dispatch_pending(publish)
+
+
 @router.post(
     "/documents/upload",
     response_model=DocumentUploadResponse,
     status_code=202,
 )
-@limiter.limit(get_settings().ingest_rate_limit)
+@limiter.limit(lambda: get_settings().ingest_rate_limit)
 async def upload_document(
     request: Request,
     response: Response,
@@ -182,10 +210,25 @@ async def upload_document(
                     extra={"extra_data": {"document_id": row["id"]}},
                 )
 
+        dispatch_run_id = new_langsmith_run_id()
+        langsmith_extra = {
+            "metadata": {
+                "request_id": request.state.request_id,
+                "environment": settings.app_env,
+                "tenant_id": settings.effective_tenant_id,
+                "document_id": str(row["id"]),
+                "indexing_version": settings.indexing_version,
+            }
+        }
+        if dispatch_run_id is not None:
+            langsmith_extra["run_id"] = dispatch_run_id
+
         try:
             await run_in_threadpool(
-                repository.dispatch_pending,
-                process_document.apply_async,
+                _dispatch_queued_documents,
+                repository,
+                str(row["id"]),
+                langsmith_extra=langsmith_extra,
             )
         except Exception:
             logger.exception(
@@ -195,6 +238,8 @@ async def upload_document(
 
         request.app.state.cache.clear()
         response.headers["Location"] = f"/documents/{row['id']}"
+        if dispatch_run_id is not None:
+            response.headers["X-LangSmith-Run-Id"] = dispatch_run_id
         logger.info(
             "Document upload accepted",
             extra={

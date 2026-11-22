@@ -1,7 +1,8 @@
-from contextlib import nullcontext
+import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 import pytest
@@ -11,7 +12,11 @@ from langchain_core.documents import Document
 from app import main
 from app.api import documents as document_api
 from app.agent import ProductionAgent
-from app.config import Settings
+from app.config import (
+    Settings,
+    configure_langsmith_tracing,
+    flush_langsmith_traces,
+)
 
 pytestmark = pytest.mark.integration
 SECURITY_HEADERS = {
@@ -23,16 +28,35 @@ SECURITY_HEADERS = {
 }
 
 
+class StartupLogCapture(logging.Handler):
+    """Collect the startup log fields because the app logger does not propagate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fields: dict[str, object] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        extra_data = getattr(record, "extra_data", None)
+        if isinstance(extra_data, dict) and "langsmith_project" in extra_data:
+            self.fields = extra_data
+
+
 class FakeAgent:
     def __init__(self, _settings):
         self.queries: list[str] = []
         self.documents: list[object] = []
+        self.langsmith_extra: dict[str, object] | None = None
 
     def database_ready(self) -> bool:
         return True
 
-    def invoke(self, message: str) -> dict[str, object]:
+    def invoke(
+        self,
+        message: str,
+        langsmith_extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         self.queries.append(message)
+        self.langsmith_extra = langsmith_extra
         return {
             "response": "Employees receive 20 days [1].",
             "model_used": "primary",
@@ -80,28 +104,81 @@ def test_chat_returns_sources_and_caches_response(api_client):
     assert api_client.get("/cache/stats").json()["entries"] == 1
 
 
-def test_chat_adds_correlation_metadata_to_langsmith_context(
+def test_chat_adds_correlation_metadata_to_langsmith_trace(
     api_client,
-    monkeypatch,
 ):
-    trace_context = Mock(side_effect=lambda **_kwargs: nullcontext())
-    monkeypatch.setattr(main, "tracing_context", trace_context)
-
     response = api_client.post(
         "/chat",
         json={"message": "How many leave days?", "thread_id": "test-thread"},
     )
 
     assert response.status_code == 200
-    trace_context.assert_called_once()
-    options = trace_context.call_args.kwargs
-    assert options["tags"] == ["api", "chat"]
-    assert options["metadata"] == {
+    trace_options = api_client.app.state.agent.langsmith_extra
+    assert trace_options["tags"] == ["api", "chat"]
+    assert trace_options["metadata"] == {
         "request_id": response.headers["X-Request-ID"],
         "environment": "development",
         "tenant_id": "local",
+        "indexing_version": api_client.app.state.settings.indexing_version,
         "thread_id": "test-thread",
     }
+    # Tracing is off, so the API cannot promise a trace to look up.
+    assert "run_id" not in trace_options
+    assert "X-LangSmith-Run-Id" not in response.headers
+
+
+def test_chat_returns_the_langsmith_trace_id_when_tracing_is_on(monkeypatch):
+    settings = Settings(
+        _env_file=None,
+        ingest_api_key=SecretStr("ingest-secret"),
+        langsmith_tracing=True,
+        langsmith_api_key=SecretStr("test-langsmith-key"),
+    )
+    settings.database_url = None
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+    configure_langsmith_tracing(settings)
+
+    with TestClient(main.app) as client:
+        response = client.post("/chat", json={"message": "Hello"})
+
+    assert response.status_code == 200
+    trace_id = response.headers["X-LangSmith-Run-Id"]
+    UUID(trace_id)
+    assert client.app.state.agent.langsmith_extra["run_id"] == trace_id
+
+
+def test_startup_log_reports_the_langsmith_state(monkeypatch):
+    """The startup line is where operators read which traces leave the host."""
+    settings = Settings(
+        _env_file=None,
+        langsmith_tracing=True,
+        langsmith_api_key=SecretStr("test-langsmith-key"),
+        langsmith_tracing_sampling_rate=0.25,
+        langsmith_hide_inputs=True,
+    )
+    settings.database_url = None
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+
+    captured = StartupLogCapture()
+    main.logger.addHandler(captured)
+    try:
+        with TestClient(main.app):
+            pass
+    finally:
+        main.logger.removeHandler(captured)
+
+    assert captured.fields["langsmith_tracing"] is True
+    assert captured.fields["langsmith_project"] == "prod-rag-development"
+    # A blank endpoint is the US API; a regional key needs its own host here.
+    assert captured.fields["langsmith_endpoint"] == (
+        "https://api.smith.langchain.com"
+    )
+    assert captured.fields["langsmith_sampling_rate"] == 0.25
+    assert captured.fields["langsmith_hide_inputs"] is True
+    # Unset output hiding still reports the effective value, not None.
+    assert captured.fields["langsmith_hide_outputs"] is False
 
 
 def test_ingestion_requires_key_and_indexes_documents(api_client):
@@ -205,6 +282,39 @@ def test_ingestion_endpoint_applies_its_rate_limit(monkeypatch):
     assert responses[5].status_code == 429
 
 
+def test_rate_limits_use_the_settings_the_app_runs_on(monkeypatch):
+    settings = Settings(
+        _env_file=None,
+        ingest_api_key=SecretStr("ingest-secret"),
+        rate_limit="1/minute",
+        ingest_rate_limit="2/minute",
+    )
+    settings.database_url = None
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+
+    with TestClient(main.app, client=("198.51.100.28", 12345)) as client:
+        ingest_responses = [
+            client.post(
+                "/documents",
+                json={"documents": [{"source": "guide", "content": "Document."}]},
+                headers={"X-Ingest-API-Key": "ingest-secret"},
+            )
+            for _ in range(3)
+        ]
+        chat_responses = [
+            client.post(
+                "/chat",
+                json={"message": "How many leave days?", "thread_id": f"t-{index}"},
+            )
+            for index in range(2)
+        ]
+
+    assert [response.status_code for response in ingest_responses[:2]] == [200, 200]
+    assert ingest_responses[2].status_code == 429
+    assert [response.status_code for response in chat_responses] == [200, 429]
+
+
 def test_upload_queues_file_and_exposes_protected_job_status(
     tmp_path,
     monkeypatch,
@@ -275,7 +385,78 @@ def test_upload_queues_file_and_exposes_protected_job_status(
     }
     assert queued_task.apply_async.call_args_list[0].kwargs == expected_dispatch
     assert queued_task.apply_async.call_args_list[1].kwargs == expected_dispatch
+    # Tracing is off, so the API cannot promise a trace to look up.
+    assert "X-LangSmith-Run-Id" not in accepted.headers
     assert engine.dispose.called
+
+
+def test_upload_reports_the_dispatch_trace_and_its_metadata(
+    tmp_path,
+    monkeypatch,
+    recorded_traces,
+):
+    settings = Settings(
+        _env_file=None,
+        ingest_api_key=SecretStr("ingest-secret"),
+        database_url=SecretStr("postgresql+psycopg://user:pass@localhost/rag"),
+        upload_dir=str(tmp_path),
+        tenant_id="tenant-upload",
+        langsmith_tracing=True,
+        langsmith_api_key=SecretStr("test-langsmith-key"),
+    )
+    repository = FakeDocumentRepository()
+    published: list[dict] = []
+    engine = SimpleNamespace(dispose=Mock())
+    queued_task = SimpleNamespace(
+        apply_async=lambda **kwargs: published.append(kwargs) or True
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "ProductionAgent", FakeAgent)
+    monkeypatch.setattr(main, "create_database_engine", lambda _settings: engine)
+    monkeypatch.setattr(
+        main,
+        "DocumentRepository",
+        lambda _engine, **_kwargs: repository,
+    )
+    monkeypatch.setattr(document_api, "process_document", queued_task)
+    configure_langsmith_tracing(settings)
+
+    with TestClient(main.app, client=("198.51.100.41", 12345)) as client:
+        accepted = client.post(
+            "/documents/upload",
+            files={
+                "file": (
+                    "handbook.txt",
+                    b"Employees receive 20 days of annual leave.",
+                    "text/plain",
+                )
+            },
+            headers={"X-Ingest-API-Key": "ingest-secret"},
+        )
+        flush_langsmith_traces()
+
+    assert accepted.status_code == 202
+    document_id = accepted.json()["document_id"]
+    run_id = accepted.headers["X-LangSmith-Run-Id"]
+    assert UUID(run_id)
+    dispatch = next(
+        run for run in recorded_traces["runs"] if run.get("name") == "document.dispatch"
+    )
+    # The response hands back the id of the span the upload actually created.
+    assert str(dispatch["id"]) == run_id
+    assert str(dispatch["trace_id"]) == run_id
+    assert dispatch["inputs"] == {"document_id": document_id}
+    assert dispatch["tags"] == ["api", "ingestion"]
+    metadata = dispatch["extra"]["metadata"]
+    assert metadata["document_id"] == document_id
+    assert metadata["tenant_id"] == "tenant-upload"
+    assert metadata["environment"] == "development"
+    assert metadata["indexing_version"] == settings.indexing_version
+    assert metadata["request_id"] == accepted.headers["X-Request-ID"]
+    # The queued job carries the same trace, so indexing nests under this span.
+    assert published[0]["kwargs"] == {
+        "langsmith_parent_trace": dispatch["dotted_order"]
+    }
 
 
 def test_upload_and_job_status_reject_missing_or_invalid_ingest_keys(api_client):
@@ -529,7 +710,11 @@ def test_rag_failure_returns_safe_upstream_error(monkeypatch):
     monkeypatch.setattr(main, "get_settings", lambda: settings)
 
     class FailedAgent(FakeAgent):
-        def invoke(self, message: str) -> dict[str, object]:
+        def invoke(
+            self,
+            message: str,
+            langsmith_extra: dict[str, object] | None = None,
+        ) -> dict[str, object]:
             raise RuntimeError("provider secret details")
 
     monkeypatch.setattr(main, "ProductionAgent", FailedAgent)

@@ -2,6 +2,8 @@ from pathlib import Path
 
 import yaml
 
+from app.config import Settings
+
 
 ROOT = Path(__file__).parents[1]
 
@@ -129,6 +131,62 @@ def test_render_blueprint_has_api_worker_dispatcher_and_redis():
             for entry in services[service_name]["envVars"]
         }
         assert "TENANT_ID" in env_keys
+
+
+def test_render_blueprint_puts_every_service_in_one_langsmith_project():
+    blueprint = _read_yaml("render.yaml")
+    services = {service["name"]: service for service in blueprint["services"]}
+
+    for service_name in (
+        "prod-rag-api",
+        "prod-rag-ingestion",
+        "prod-rag-job-dispatcher",
+    ):
+        env_vars = {
+            entry["key"]: entry
+            for entry in services[service_name]["envVars"]
+        }
+        assert env_vars["LANGSMITH_PROJECT"]["value"] == "prod-rag-production"
+        assert env_vars["LANGSMITH_TRACING"]["value"] == "false"
+        # Tracing stays off until the key is filled in the Render dashboard.
+        assert env_vars["LANGSMITH_API_KEY"]["sync"] is False
+
+
+def test_local_compose_leaves_langsmith_tracing_to_the_developers_env_file():
+    compose = _read_yaml("app/docker-compose.yml")
+
+    for service_name in ("agent-api", "ingestion-worker", "job-dispatcher"):
+        service = compose["services"][service_name]
+        assert any(
+            entry["path"].endswith(".env") for entry in service["env_file"]
+        )
+        assert not [key for key in service["environment"] if "LANGSMITH" in key]
+
+
+def test_env_example_documents_every_langsmith_setting():
+    lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    assignments = {
+        line.split("=", 1)[0]: line.split("=", 1)[1]
+        for line in lines
+        if line.startswith("LANGSMITH_")
+    }
+    expected = {
+        name.upper() for name in Settings.model_fields if name.startswith("langsmith_")
+    }
+
+    # A new tracing setting is only usable once the template teaches it.
+    assert set(assignments) == expected
+    assert assignments["LANGSMITH_TRACING"] == "false"
+    # The template carries no secret, and blank values keep the project name and
+    # payload visibility environment-aware instead of pinning them.
+    for name in (
+        "LANGSMITH_API_KEY",
+        "LANGSMITH_PROJECT",
+        "LANGSMITH_ENDPOINT",
+        "LANGSMITH_HIDE_INPUTS",
+        "LANGSMITH_HIDE_OUTPUTS",
+    ):
+        assert assignments[name] == ""
 
 
 def test_local_compose_uses_development_defaults_and_plain_http_ollama():

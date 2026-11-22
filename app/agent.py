@@ -13,14 +13,37 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_postgres import PGVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langsmith import traceable
+from langsmith import (
+    get_current_run_tree,
+    traceable,
+)
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from app.config import Settings, get_settings
+from app.config import (
+    Settings,
+    get_settings,
+    record_langsmith_feedback,
+)
 from app.database.engine import create_database_engine
 from app.models import DocumentInput, GroundingStatus, ParsedDocument
 from app.monitoring import get_logger
+
+
+def _trace_step_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Record traced arguments without the bound agent instance."""
+    return {name: value for name, value in inputs.items() if name != "self"}
+
+
+def _trace_ingestion_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Summarize ingested documents instead of copying their full text."""
+    documents = inputs.get("documents") or []
+    return {
+        "document_count": len(documents),
+        "sources": sorted(
+            {str(getattr(document, "source", "unknown")) for document in documents}
+        ),
+    }
 
 
 class CircuitBreakerOpen(Exception):
@@ -414,43 +437,18 @@ class ProductionAgent:
 
     @traceable(name="rag.invoke", run_type="chain")
     def invoke(self, message: str) -> dict[str, Any]:
-        queries = [message]
-        if self.query_expansion_enabled:
-            try:
-                rewrites = self._llm_circuit.call(
-                    self.query_rewriter.invoke,
-                    {
-                        "question": message,
-                        "query_count": self.query_expansion_count,
-                    },
-                )
-                queries.extend(
-                    self._parse_rewritten_queries(
-                        message,
-                        rewrites,
-                        max_queries=self.query_expansion_count,
-                    )
-                )
-            except Exception as rewrite_error:
-                self.logger.warning(
-                    "Query expansion failed; using the original question",
-                    extra={
-                        "extra_data": {
-                            "error_type": type(rewrite_error).__name__,
-                        }
-                    },
-                )
+        queries = self._expand_queries(message)
 
         documents = self._retrieve_documents(queries)
         context, sources = self._format_context(documents)
         if not documents:
             response, model_used = self._answer_from_general_knowledge(message)
-            return {
-                "response": response,
-                "model_used": model_used,
-                "sources": [],
-                "grounding_status": "unverified",
-            }
+            return self._answer_payload(
+                response=response,
+                model_used=model_used,
+                sources=[],
+                grounding_status="unverified",
+            )
 
         try:
             response = self._llm_circuit.call(
@@ -482,12 +480,12 @@ class ProductionAgent:
 
         if self._is_source_abstention(response):
             response, model_used = self._answer_from_general_knowledge(message)
-            return {
-                "response": response,
-                "model_used": model_used,
-                "sources": [],
-                "grounding_status": "unverified",
-            }
+            return self._answer_payload(
+                response=response,
+                model_used=model_used,
+                sources=[],
+                grounding_status="unverified",
+            )
 
         grounding_status: GroundingStatus = "unverified"
         if not self._has_valid_citation_format(response, len(sources)):
@@ -496,12 +494,12 @@ class ProductionAgent:
                 "using general knowledge"
             )
             response, model_used = self._answer_from_general_knowledge(message)
-            return {
-                "response": response,
-                "model_used": model_used,
-                "sources": [],
-                "grounding_status": "unverified",
-            }
+            return self._answer_payload(
+                response=response,
+                model_used=model_used,
+                sources=[],
+                grounding_status="unverified",
+            )
 
         grounding_status = self._check_grounding(
             message,
@@ -519,13 +517,66 @@ class ProductionAgent:
                 },
             )
             response, model_used = self._answer_from_general_knowledge(message)
-            return {
-                "response": response,
-                "model_used": model_used,
-                "sources": [],
-                "grounding_status": grounding_status,
-            }
+            return self._answer_payload(
+                response=response,
+                model_used=model_used,
+                sources=[],
+                grounding_status=grounding_status,
+            )
 
+        return self._answer_payload(
+            response=response,
+            model_used=model_used,
+            sources=sources,
+            grounding_status=grounding_status,
+        )
+
+    @traceable(
+        name="rag.query_expansion",
+        run_type="chain",
+        process_inputs=_trace_step_inputs,
+    )
+    def _expand_queries(self, message: str) -> list[str]:
+        """Rewrite the question into several retrieval variants."""
+        queries = [message]
+        if not self.query_expansion_enabled:
+            return queries
+        try:
+            rewrites = self._llm_circuit.call(
+                self.query_rewriter.invoke,
+                {
+                    "question": message,
+                    "query_count": self.query_expansion_count,
+                },
+            )
+            queries.extend(
+                self._parse_rewritten_queries(
+                    message,
+                    rewrites,
+                    max_queries=self.query_expansion_count,
+                )
+            )
+        except Exception as rewrite_error:
+            self.logger.warning(
+                "Query expansion failed; using the original question",
+                extra={
+                    "extra_data": {
+                        "error_type": type(rewrite_error).__name__,
+                    }
+                },
+            )
+        return queries
+
+    def _answer_payload(
+        self,
+        *,
+        response: str,
+        model_used: str,
+        sources: list[str],
+        grounding_status: GroundingStatus,
+    ) -> dict[str, Any]:
+        """Build the chat payload and score it on the current trace."""
+        self._record_trace_feedback(sources, grounding_status)
         return {
             "response": response,
             "model_used": model_used,
@@ -533,6 +584,32 @@ class ProductionAgent:
             "grounding_status": grounding_status,
         }
 
+    @staticmethod
+    def _record_trace_feedback(
+        sources: list[str],
+        grounding_status: GroundingStatus,
+    ) -> None:
+        """Attach free quality signals to the trace for LangSmith analytics."""
+        run_tree = get_current_run_tree()
+        if run_tree is None:
+            return
+        signals = {
+            "grounded": (grounding_status == "supported", grounding_status),
+            "cited": (bool(sources), len(sources)),
+        }
+        for key, (passed, value) in signals.items():
+            record_langsmith_feedback(
+                trace_id=str(run_tree.trace_id),
+                key=key,
+                value=value,
+                score=1 if passed else 0,
+            )
+
+    @traceable(
+        name="rag.grounding",
+        run_type="chain",
+        process_inputs=_trace_step_inputs,
+    )
     def _check_grounding(
         self,
         question: str,
@@ -750,6 +827,11 @@ class ProductionAgent:
         """Public single-query retrieval entry point for evaluation tooling."""
         return self._retrieve_documents([query])
 
+    @traceable(
+        name="rag.retrieve",
+        run_type="tool",
+        process_inputs=_trace_step_inputs,
+    )
     def _retrieve_documents(self, queries: list[str]) -> list[Document]:
         ranked_documents: dict[str, tuple[float, int, Document]] = {}
         for query_index, query in enumerate(queries):
@@ -896,6 +978,11 @@ class ProductionAgent:
         ranked = [document for score, document in scored if score > 0]
         return ranked or candidates
 
+    @traceable(
+        name="rag.rerank",
+        run_type="tool",
+        process_inputs=_trace_step_inputs,
+    )
     def _cohere_rerank(
         self,
         query: str,
@@ -996,6 +1083,11 @@ class ProductionAgent:
             context_chars += len(section)
         return "".join(context_parts), sources
 
+    @traceable(
+        name="document.ingest",
+        run_type="chain",
+        process_inputs=_trace_ingestion_inputs,
+    )
     def ingest_documents(self, documents: list[DocumentInput]) -> int:
         return self._index_documents(documents)
 

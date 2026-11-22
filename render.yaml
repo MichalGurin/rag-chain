@@ -13,6 +13,10 @@ services:
         value: INFO
       - key: LANGSMITH_TRACING
         value: "false"
+      - key: LANGSMITH_PROJECT
+        value: prod-rag-production
+      - key: LANGSMITH_API_KEY
+        sync: false
       - key: RATE_LIMIT
         value: "20/minute"
       - key: INGEST_RATE_LIMIT
@@ -96,6 +100,10 @@ services:
         value: INFO
       - key: LANGSMITH_TRACING
         value: "false"
+      - key: LANGSMITH_PROJECT
+        value: prod-rag-production
+      - key: LANGSMITH_API_KEY
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: REDIS_URL
@@ -153,6 +161,12 @@ services:
         value: production
       - key: LOG_LEVEL
         value: INFO
+      - key: LANGSMITH_TRACING
+        value: "false"
+      - key: LANGSMITH_PROJECT
+        value: prod-rag-production
+      - key: LANGSMITH_API_KEY
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: REDIS_URL
